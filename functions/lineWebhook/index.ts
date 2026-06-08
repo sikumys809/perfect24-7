@@ -44,6 +44,24 @@ async function fetchLineContent(messageId: string) {
   return { arrayBuffer, contentType };
 }
 
+async function replyLineMessage(replyToken: string, text: string) {
+  const url = 'https://api.line.me/v2/bot/message/reply';
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}`,
+    },
+    body: JSON.stringify({
+      replyToken,
+      messages: [{ type: 'text', text }],
+    }),
+  });
+  if (!res.ok) {
+    throw new Error(`Failed to reply to LINE message: ${res.status}`);
+  }
+}
+
 export async function handler(req: Request): Promise<Response> {
   try {
     if (req.method !== 'POST') {
@@ -86,6 +104,10 @@ export async function handler(req: Request): Promise<Response> {
           await supabase.from('processing_jobs').insert([
             { receipt_id: receipt?.id ?? null, status: 'pending', queued_at: new Date().toISOString() },
           ]);
+
+          if (ev.replyToken) {
+            await replyLineMessage(ev.replyToken, '画像を受け取りました。保存が完了しました。');
+          }
         }
       } catch (innerErr) {
         console.error('Event processing error', innerErr);
