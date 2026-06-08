@@ -1,0 +1,19 @@
+{
+  "name": "perfect24-7",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start:worker": "ts-node src/workers/processor.ts",
+    "build": "tsc",
+    "lint": "echo 'Add linter'"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.0.0",
+    "dotenv": "^16.0.0"
+  },
+  "devDependencies": {
+    "ts-node": "^10.0.0",
+    "typescript": "^4.0.0"
+  }
+}
