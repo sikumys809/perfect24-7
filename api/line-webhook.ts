@@ -90,10 +90,62 @@ function stripJson(text: string): string {
   return s >= 0 && e > s ? text.slice(s, e + 1) : text.trim();
 }
 
+// インボイス登録番号(T+法人番号13桁)のチェックディジット検証
+// 戻り値: true=妥当 / false=不正(誤読の可能性) / null=未取得で判定不能
+function validateRegistrationNumber(reg: unknown): boolean | null {
+  if (typeof reg !== 'string') return null;
+  const m = reg.match(/^T(\d{13})$/);
+  if (!m) return false;
+  const digits = m[1];
+  const check = Number(digits[0]); // 先頭がチェックディジット
+  const base = digits.slice(1); // 残り12桁
+  let sum = 0;
+  for (let i = 0; i < 12; i++) {
+    const p = Number(base[11 - i]); // 下n桁目(n=i+1)
+    const q = i % 2 === 0 ? 1 : 2; // nが奇数=1 / 偶数=2
+    sum += p * q;
+  }
+  return check === 9 - (sum % 9);
+}
+
+// 抽出結果の検算。怪しい点があれば notes に積む（弾かず「要確認」フラグ用）
+function validateExtraction(
+  ex: any,
+  total: number | null,
+  tax: number | null,
+  issued: string | null,
+): { needsReview: boolean; notes: string[] } {
+  const notes: string[] = [];
+
+  const regValid = validateRegistrationNumber(ex?.registration_number);
+  if (regValid === false) notes.push('登録番号の形式または検査数字が不正（誤読の可能性）');
+  if (regValid === true && issued && issued < '2023-10-01') {
+    notes.push(`日付 ${issued} が登録番号の存在(2023年10月以降)と矛盾（年の誤読の可能性）`);
+  }
+
+  const rateMap: Record<string, number> = { '10%': 0.1, '8%': 0.08 };
+  const r = ex?.tax_rate ? rateMap[ex.tax_rate] : undefined;
+  if (total != null && tax != null && r != null) {
+    const expected = Math.round(total - total / (1 + r));
+    if (Math.abs(tax - expected) > 2) {
+      notes.push(`消費税額が税率${ex.tax_rate}と不整合（税込${total}なら約${expected}円のはず）`);
+    }
+  }
+
+  const conf = toNum(ex?.confidence);
+  if (conf != null && conf < 0.7) notes.push(`信頼度が低い(${conf})`);
+
+  return { needsReview: notes.length > 0, notes };
+}
+
 // 画像をClaude Opus 4.8に渡して構造化データを抽出
 async function extractReceipt(buffer: Buffer, contentType: string): Promise<any> {
   const allowed = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
   const mediaType = allowed.includes(contentType) ? contentType : 'image/jpeg';
+  const today = new Date().toISOString().slice(0, 10);
+  const prompt = `${EXTRACTION_PROMPT}
+
+今日は ${today} です。日付の2桁年（例:「26」）は西暦の下2桁とみなし、今日に最も近い年として解釈してください（例: 今日が2026年なら「26-05-18」は 2026-05-18）。和暦（令和/平成）表記は西暦に変換してください。`;
   const res: any = await anthropic.messages.create({
     model: 'claude-opus-4-8',
     max_tokens: 2000,
@@ -105,7 +157,7 @@ async function extractReceipt(buffer: Buffer, contentType: string): Promise<any>
             type: 'image',
             source: { type: 'base64', media_type: mediaType as any, data: buffer.toString('base64') },
           },
-          { type: 'text', text: EXTRACTION_PROMPT },
+          { type: 'text', text: prompt },
         ],
       },
     ],
@@ -202,6 +254,25 @@ async function processWebhookEvents(bodyText: string) {
               confidence: conf,
               source: 'claude-opus-4-8',
             }));
+          // 検算バリデーション → 要確認フラグを extracted_fields に残す
+          const validation = validateExtraction(ex, total, tax, issued);
+          fieldRows.push({
+            receipt_id: receipt?.id ?? null,
+            field_name: 'needs_review',
+            field_value: String(validation.needsReview),
+            confidence: null,
+            source: 'validation',
+          });
+          if (validation.notes.length) {
+            fieldRows.push({
+              receipt_id: receipt?.id ?? null,
+              field_name: 'validation_notes',
+              field_value: validation.notes.join(' / '),
+              confidence: null,
+              source: 'validation',
+            });
+          }
+
           if (fieldRows.length) await supabase.from('extracted_fields').insert(fieldRows);
 
           await supabase
@@ -211,9 +282,10 @@ async function processWebhookEvents(bodyText: string) {
 
           if (ev.replyToken) {
             const yen = total != null ? `¥${total.toLocaleString()}` : '金額不明';
+            const warn = validation.needsReview ? `\n⚠️要確認: ${validation.notes.join(' / ')}` : '';
             await replyLineMessage(
               ev.replyToken,
-              `登録しました。\n${ex.vendor ?? '店名不明'} / ${issued ?? '日付不明'} / ${yen}`,
+              `登録しました。\n${ex.vendor ?? '店名不明'} / ${issued ?? '日付不明'} / ${yen}${warn}`,
             );
           }
         } catch (exErr) {
