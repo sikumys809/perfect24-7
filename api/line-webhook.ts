@@ -8,7 +8,9 @@ export const config = { api: { bodyParser: false } };
 
 const LINE_CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET ?? '';
 const LINE_CHANNEL_ACCESS_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN ?? '';
-const SUPABASE_URL = process.env.SUPABASE_URL ?? '';
+// supabase-js はベースURL (https://xxxx.supabase.co) を期待するため、
+// 末尾に "/rest/v1" が付いていても剥がして渡す
+const SUPABASE_URL = (process.env.SUPABASE_URL ?? '').replace(/\/rest\/v1\/?$/, '');
 const SUPABASE_KEY = process.env.SUPABASE_KEY ?? '';
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
