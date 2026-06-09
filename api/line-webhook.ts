@@ -61,7 +61,9 @@ async function processWebhookEvents(bodyText: string) {
       if (ev.type === 'message' && ev.message?.type === 'image') {
         const messageId = ev.message.id;
         const { buffer, contentType } = await fetchLineContent(messageId);
-        const path = `receipts/${new Date().toISOString()}_${messageId}`;
+        // Supabase Storage のキーは ":" "." を許可しないため安全な形に置換
+        const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+        const path = `receipts/${timestamp}_${messageId}`;
 
         const { error: uploadError } = await supabase.storage
           .from('receipts')
