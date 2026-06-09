@@ -164,6 +164,44 @@ function validateExtraction(
   return { needsReview: notes.length > 0, notes };
 }
 
+type BankRow = {
+  line_no: number;
+  withdrawal: number | null;
+  deposit: number | null;
+  balance: number | null;
+  confidence: number | null;
+};
+
+// 通帳明細の残高検算。「前残高 + 入金 - 出金 = 当残高」が成り立たない行を誤読候補として拾う。
+// 弾かず needs_review フラグ用。残高が読めない行はスキップ（判定不能）。
+function validateBankTransactions(rows: BankRow[]): {
+  needsReview: boolean;
+  notes: string[];
+  badLines: number[];
+} {
+  const notes: string[] = [];
+  const badLines: number[] = [];
+
+  for (let i = 1; i < rows.length; i++) {
+    const prev = rows[i - 1];
+    const cur = rows[i];
+    if (prev.balance == null || cur.balance == null) continue; // 残高未取得は判定不能
+    const delta = cur.balance - prev.balance; // 残高の増減
+    const txn = (cur.deposit ?? 0) - (cur.withdrawal ?? 0); // 取引額（入金+ / 出金-）
+    if (Math.abs(delta - txn) > 1) {
+      badLines.push(cur.line_no);
+    }
+  }
+  if (badLines.length) {
+    notes.push(`残高が不整合の行: ${badLines.join(', ')}行目（金額または残高の誤読の可能性）`);
+  }
+
+  const low = rows.filter((r) => r.confidence != null && (r.confidence as number) < 0.7).length;
+  if (low > 0) notes.push(`信頼度が低い行が${low}件`);
+
+  return { needsReview: notes.length > 0, notes, badLines };
+}
+
 // 画像/PDF を Claude Opus 4.8 に渡して構造化データ（複数件）を抽出
 async function extractDocument(buffer: Buffer, contentType: string): Promise<any> {
   const today = new Date().toISOString().slice(0, 10);
@@ -296,8 +334,11 @@ async function saveReceipt(ex: any, ctx: SaveCtx): Promise<string> {
   return `${ex?.vendor ?? '店名不明'} / ${issued ?? '日付不明'} / ${yen}${warn}`;
 }
 
-// 通帳1冊分（取引明細の配列）を保存し、返信用の件数を返す
-async function saveBankTransactions(txns: any[], ctx: SaveCtx): Promise<number> {
+// 通帳1冊分（取引明細の配列）を保存し、件数と残高検算の結果を返す
+async function saveBankTransactions(
+  txns: any[],
+  ctx: SaveCtx,
+): Promise<{ count: number; validation: ReturnType<typeof validateBankTransactions> }> {
   const { data: receipt } = await supabase
     .from('receipts')
     .insert({ original_filename: ctx.messageId, source: 'LINE', document_type: 'bankbook' })
@@ -324,6 +365,28 @@ async function saveBankTransactions(txns: any[], ctx: SaveCtx): Promise<number> 
   }));
   if (rows.length) await supabase.from('bank_transactions').insert(rows);
 
+  // 残高検算（誤読候補は弾かず needs_review として記録）
+  const validation = validateBankTransactions(rows);
+  const fieldRows = [
+    {
+      receipt_id: receipt?.id ?? null,
+      field_name: 'needs_review',
+      field_value: String(validation.needsReview),
+      confidence: null,
+      source: 'validation',
+    },
+  ];
+  if (validation.notes.length) {
+    fieldRows.push({
+      receipt_id: receipt?.id ?? null,
+      field_name: 'validation_notes',
+      field_value: validation.notes.join(' / '),
+      confidence: null,
+      source: 'validation',
+    });
+  }
+  await supabase.from('extracted_fields').insert(fieldRows);
+
   const now = new Date().toISOString();
   await supabase.from('processing_jobs').insert({
     receipt_id: receipt?.id ?? null,
@@ -333,7 +396,7 @@ async function saveBankTransactions(txns: any[], ctx: SaveCtx): Promise<number> 
     finished_at: now,
   });
 
-  return rows.length;
+  return { count: rows.length, validation };
 }
 
 // 抽出失敗・該当なし時：画像は保存しつつハッシュは付けない（=再送で再処理できる）
@@ -432,9 +495,16 @@ async function processWebhookEvents(bodyText: string) {
           }
           continue;
         }
-        const count = await saveBankTransactions(txns, { ...ctx, imageHash: fileHash, docType });
+        const { count, validation } = await saveBankTransactions(txns, {
+          ...ctx,
+          imageHash: fileHash,
+          docType,
+        });
         if (ev.replyToken) {
-          await replyLineMessage(ev.replyToken, `通帳を登録しました（明細${count}件）`);
+          const warn = validation.badLines.length
+            ? `\n⚠️ ${validation.badLines.join(', ')}行目の残高が合いません（金額の誤読の可能性。要確認）`
+            : '';
+          await replyLineMessage(ev.replyToken, `通帳を登録しました（明細${count}件）${warn}`);
         }
         continue;
       }
