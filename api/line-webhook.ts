@@ -5,7 +5,8 @@ import { createClient } from '@supabase/supabase-js';
 import Anthropic from '@anthropic-ai/sdk';
 
 // LINE署名を生データで検証するため、Vercelの自動body解析を無効化
-export const config = { api: { bodyParser: false } };
+// 大きめPDFの解析に時間がかかるため実行上限を延長（Hobbyの上限60秒）
+export const config = { api: { bodyParser: false }, maxDuration: 60 };
 
 const LINE_CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET ?? '';
 const LINE_CHANNEL_ACCESS_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN ?? '';
@@ -168,12 +169,14 @@ async function extractDocument(buffer: Buffer, contentType: string): Promise<any
         },
       };
 
-  const res: any = await anthropic.messages.create({
+  // 多件数でも途中で切れないよう出力上限を確保し、ストリーミングでタイムアウトを回避
+  const stream = anthropic.messages.stream({
     model: 'claude-opus-4-8',
-    max_tokens: 4000,
+    max_tokens: 16000,
     messages: [{ role: 'user', content: [block as any, { type: 'text', text: prompt }] }],
   });
-  const text = (res.content ?? [])
+  const final: any = await stream.finalMessage();
+  const text = (final.content ?? [])
     .filter((b: any) => b.type === 'text')
     .map((b: any) => b.text)
     .join('');
