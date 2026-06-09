@@ -245,13 +245,19 @@ type SaveCtx = {
   contentType: string;
   imageHash: string | null; // 重複弾き用ハッシュ。代表1件のみ付与、他は null
   docType?: string | null; // receipt / invoice / bankbook / other
+  clientId?: string | null; // どの顧問先の書類か
 };
 
 // 抽出1件分を保存し、返信用サマリ行を返す
 async function saveReceipt(ex: any, ctx: SaveCtx): Promise<string> {
   const { data: receipt } = await supabase
     .from('receipts')
-    .insert({ original_filename: ctx.messageId, source: 'LINE', document_type: ctx.docType ?? null })
+    .insert({
+      original_filename: ctx.messageId,
+      source: 'LINE',
+      document_type: ctx.docType ?? null,
+      client_id: ctx.clientId ?? null,
+    })
     .select()
     .single();
 
@@ -341,7 +347,12 @@ async function saveBankTransactions(
 ): Promise<{ count: number; validation: ReturnType<typeof validateBankTransactions> }> {
   const { data: receipt } = await supabase
     .from('receipts')
-    .insert({ original_filename: ctx.messageId, source: 'LINE', document_type: 'bankbook' })
+    .insert({
+      original_filename: ctx.messageId,
+      source: 'LINE',
+      document_type: 'bankbook',
+      client_id: ctx.clientId ?? null,
+    })
     .select()
     .single();
 
@@ -403,7 +414,11 @@ async function saveBankTransactions(
 async function saveUnprocessed(ctx: Omit<SaveCtx, 'imageHash'>, errorText: string) {
   const { data: r } = await supabase
     .from('receipts')
-    .insert({ original_filename: ctx.messageId, source: 'LINE' })
+    .insert({
+      original_filename: ctx.messageId,
+      source: 'LINE',
+      client_id: ctx.clientId ?? null,
+    })
     .select()
     .single();
   await supabase.from('receipt_images').insert({
@@ -421,6 +436,78 @@ async function saveUnprocessed(ctx: Omit<SaveCtx, 'imageHash'>, errorText: strin
   });
 }
 
+// 友達追加時・未登録時に送る案内文
+const WELCOME_MESSAGE =
+  'ご登録ありがとうございます。\nご利用には顧問先登録が必要です。事務所からお伝えした「登録コード」をこのトークに送信してください。\n登録後は領収書・請求書・通帳の画像/PDFを送るだけで自動で記帳されます。';
+
+// LINE userId から登録済み顧問先を引く（未登録なら null）
+async function findClientByLineUser(lineUserId: string) {
+  const { data } = await supabase
+    .from('clients')
+    .select('id, client_code, official_name')
+    .eq('linked_line_user_id', lineUserId)
+    .limit(1);
+  return data && data.length > 0 ? data[0] : null;
+}
+
+// テキスト（=登録コード想定）を処理して顧問先をひもづける
+async function handleRegistration(ev: any, lineUserId: string | null) {
+  if (!lineUserId) return;
+
+  // 既にひもづいていれば案内のみ
+  const existing = await findClientByLineUser(lineUserId);
+  if (existing) {
+    if (ev.replyToken) {
+      await replyLineMessage(
+        ev.replyToken,
+        `${existing.official_name} 様として登録済みです（顧問先ID: ${existing.client_code}）。\n領収書・請求書・通帳を送ってください。`,
+      );
+    }
+    return;
+  }
+
+  const code = String(ev.message?.text ?? '').trim().toUpperCase();
+
+  // 未ひもづけの顧問先を登録コードで検索
+  const { data } = await supabase
+    .from('clients')
+    .select('id, client_code, official_name')
+    .eq('registration_code', code)
+    .is('linked_line_user_id', null)
+    .limit(1);
+  const client = data && data.length > 0 ? data[0] : null;
+
+  if (!client) {
+    if (ev.replyToken) {
+      await replyLineMessage(
+        ev.replyToken,
+        '登録コードが正しくないか、既に使用済みです。事務所にご確認ください。',
+      );
+    }
+    return;
+  }
+
+  // ひもづけ（競合防止のため linked_line_user_id が null の行のみ更新）
+  const { data: updated } = await supabase
+    .from('clients')
+    .update({ linked_line_user_id: lineUserId, linked_at: new Date().toISOString() })
+    .eq('id', client.id)
+    .is('linked_line_user_id', null)
+    .select('id')
+    .limit(1);
+
+  if (ev.replyToken) {
+    if (updated && updated.length > 0) {
+      await replyLineMessage(
+        ev.replyToken,
+        `${client.official_name} 様、登録が完了しました（顧問先ID: ${client.client_code}）。\n領収書・請求書・通帳の画像/PDFを送ってください。`,
+      );
+    } else {
+      await replyLineMessage(ev.replyToken, 'この登録コードは既に使用済みです。事務所にご確認ください。');
+    }
+  }
+}
+
 // 200を返した後にバックグラウンドで実行される処理
 async function processWebhookEvents(bodyText: string) {
   const payload = JSON.parse(bodyText);
@@ -428,8 +515,31 @@ async function processWebhookEvents(bodyText: string) {
 
   for (const ev of events) {
     try {
-      const msgType = ev?.type === 'message' ? ev.message?.type : null;
+      const lineUserId = ev?.source?.userId ?? null;
+
+      // 友達追加：登録の案内を返す
+      if (ev.type === 'follow') {
+        if (ev.replyToken) await replyLineMessage(ev.replyToken, WELCOME_MESSAGE);
+        continue;
+      }
+
+      if (ev.type !== 'message') continue;
+      const msgType = ev.message?.type;
+
+      // テキストは登録コードとして処理
+      if (msgType === 'text') {
+        await handleRegistration(ev, lineUserId);
+        continue;
+      }
+
       if (msgType !== 'image' && msgType !== 'file') continue;
+
+      // 書類は登録済み顧問先のみ受付（未登録は登録を促す）
+      const client = lineUserId ? await findClientByLineUser(lineUserId) : null;
+      if (!client) {
+        if (ev.replyToken) await replyLineMessage(ev.replyToken, WELCOME_MESSAGE);
+        continue;
+      }
 
       const messageId = ev.message.id;
       const { buffer, contentType } = await fetchLineContent(messageId);
@@ -463,7 +573,7 @@ async function processWebhookEvents(bodyText: string) {
         .upload(path, buffer, { contentType });
       if (uploadError) throw uploadError;
 
-      const ctx = { messageId, path, contentType };
+      const ctx = { messageId, path, contentType, clientId: client.id };
 
       // 抽出（複数件）
       let doc: any;
