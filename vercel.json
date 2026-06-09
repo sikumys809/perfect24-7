@@ -1,0 +1,3 @@
+{
+  "buildCommand": "echo 'No build step: Vercel compiles api/ functions automatically'"
+}
