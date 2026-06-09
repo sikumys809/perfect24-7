@@ -179,6 +179,21 @@ async function processWebhookEvents(bodyText: string) {
       if (ev.type === 'message' && ev.message?.type === 'image') {
         const messageId = ev.message.id;
         const { buffer, contentType } = await fetchLineContent(messageId);
+
+        // 完全同一画像の重複弾き（SHA-256ハッシュ照合）。内容ベースでは弾かない
+        const imageHash = crypto.createHash('sha256').update(buffer).digest('hex');
+        const { data: dup } = await supabase
+          .from('receipt_images')
+          .select('id')
+          .eq('image_sha256', imageHash)
+          .limit(1);
+        if (dup && dup.length > 0) {
+          if (ev.replyToken) {
+            await replyLineMessage(ev.replyToken, 'この画像は既に受信済みです。');
+          }
+          continue;
+        }
+
         // Supabase Storage のキーは ":" "." を許可しないため安全な形に置換
         const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
         const path = `receipts/${timestamp}_${messageId}`;
@@ -199,6 +214,7 @@ async function processWebhookEvents(bodyText: string) {
           receipt_id: receipt?.id ?? null,
           storage_path: path,
           content_type: contentType,
+          image_sha256: imageHash,
         });
         if (imageError) throw imageError;
 
