@@ -9,14 +9,17 @@
     "test": "jest",
     "test:watch": "jest --watch",
     "test:coverage": "jest --coverage",
+    "compare:receipts": "TS_NODE_TRANSPILE_ONLY=1 node --loader ts-node/esm scripts/compare-receipt-extraction.ts",
     "lint": "echo 'Add linter'"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.70.1",
     "@supabase/supabase-js": "^2.0.0",
     "@vercel/functions": "^1.0.0",
     "dotenv": "^16.0.0"
   },
   "devDependencies": {
+    "@google/genai": "^1.52.0",
     "@types/jest": "^29.0.0",
     "@vercel/node": "^3.0.0",
     "jest": "^29.0.0",

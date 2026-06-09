@@ -2,6 +2,7 @@ import type { VercelRequest, VercelResponse } from '@vercel/node';
 import crypto from 'node:crypto';
 import { waitUntil } from '@vercel/functions';
 import { createClient } from '@supabase/supabase-js';
+import Anthropic from '@anthropic-ai/sdk';
 
 // LINE署名を生データで検証するため、Vercelの自動body解析を無効化
 export const config = { api: { bodyParser: false } };
@@ -12,8 +13,10 @@ const LINE_CHANNEL_ACCESS_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN ?? '';
 // 末尾に "/rest/v1" が付いていても剥がして渡す
 const SUPABASE_URL = (process.env.SUPABASE_URL ?? '').replace(/\/rest\/v1\/?$/, '');
 const SUPABASE_KEY = process.env.SUPABASE_KEY ?? '';
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY ?? '';
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+const anthropic = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
 
 function readRawBody(req: VercelRequest): Promise<Buffer> {
   return new Promise((resolve, reject) => {
@@ -53,6 +56,67 @@ async function replyLineMessage(replyToken: string, text: string) {
   });
 }
 
+// レシート抽出用プロンプト（日本語・税務用途）
+const EXTRACTION_PROMPT = `あなたは日本語のレシート・領収書を読み取る専門家です。
+画像から以下の項目を抽出し、JSONオブジェクトのみを出力してください（前後の説明文やコードフェンスは不要）。
+読み取れない項目は推測せず null にしてください。
+チェックボックスは実際に印（チェック）が付いているもののみ採用し、印刷された選択肢を勝手に選ばないでください。
+
+スキーマ:
+{
+  "date": "YYYY-MM-DD 形式の発行日（和暦は西暦に変換。インボイス登録番号があるなら2023年10月以降のはず）。不明なら null",
+  "vendor": "店名・会社名。不明なら null",
+  "total_incl_tax": "税込合計金額（数値のみ）。不明なら null",
+  "tax_amount": "消費税額（数値のみ）。不明なら null",
+  "tax_rate": "\\"10%\\" / \\"8%\\" / \\"mixed\\" / null のいずれか",
+  "registration_number": "インボイス登録番号（T + 13桁）。無ければ null",
+  "receipt_no": "レシート番号・取引番号。無ければ null",
+  "note": "但し書き（例: 御飲食代として）。無ければ null",
+  "confidence": "抽出全体の自信度を 0〜1 の数値で"
+}`;
+
+function toNum(v: unknown): number | null {
+  if (v === null || v === undefined) return null;
+  if (typeof v === 'number') return Number.isNaN(v) ? null : v;
+  const n = Number(String(v).replace(/[^0-9.-]/g, ''));
+  return Number.isNaN(n) ? null : n;
+}
+
+function stripJson(text: string): string {
+  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fenced) return fenced[1].trim();
+  const s = text.indexOf('{');
+  const e = text.lastIndexOf('}');
+  return s >= 0 && e > s ? text.slice(s, e + 1) : text.trim();
+}
+
+// 画像をClaude Opus 4.8に渡して構造化データを抽出
+async function extractReceipt(buffer: Buffer, contentType: string): Promise<any> {
+  const allowed = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
+  const mediaType = allowed.includes(contentType) ? contentType : 'image/jpeg';
+  const res: any = await anthropic.messages.create({
+    model: 'claude-opus-4-8',
+    max_tokens: 2000,
+    messages: [
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'image',
+            source: { type: 'base64', media_type: mediaType as any, data: buffer.toString('base64') },
+          },
+          { type: 'text', text: EXTRACTION_PROMPT },
+        ],
+      },
+    ],
+  });
+  const text = (res.content ?? [])
+    .filter((b: any) => b.type === 'text')
+    .map((b: any) => b.text)
+    .join('');
+  return JSON.parse(stripJson(text));
+}
+
 // 200を返した後にバックグラウンドで実行される処理
 async function processWebhookEvents(bodyText: string) {
   const payload = JSON.parse(bodyText);
@@ -86,15 +150,84 @@ async function processWebhookEvents(bodyText: string) {
         });
         if (imageError) throw imageError;
 
-        const { error: jobError } = await supabase.from('processing_jobs').insert({
-          receipt_id: receipt?.id ?? null,
-          status: 'pending',
-          queued_at: new Date().toISOString(),
-        });
-        if (jobError) throw jobError;
+        const { data: job } = await supabase
+          .from('processing_jobs')
+          .insert({
+            receipt_id: receipt?.id ?? null,
+            status: 'processing',
+            queued_at: new Date().toISOString(),
+            started_at: new Date().toISOString(),
+          })
+          .select()
+          .single();
 
-        if (ev.replyToken) {
-          await replyLineMessage(ev.replyToken, '画像を受け取りました。保存が完了しました。');
+        // Claude Opus 4.8 で抽出 → 結果を保存
+        try {
+          const ex = await extractReceipt(buffer, contentType);
+          const total = toNum(ex.total_incl_tax);
+          const tax = toNum(ex.tax_amount);
+          const net = total != null && tax != null ? total - tax : null;
+          const issued =
+            typeof ex.date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(ex.date) ? ex.date : null;
+          const conf = toNum(ex.confidence);
+
+          await supabase
+            .from('receipts')
+            .update({
+              amount: net,
+              total_amount: total,
+              tax_amount: tax,
+              issued_date: issued,
+              description: ex.note ?? null,
+            })
+            .eq('id', receipt?.id);
+
+          const fieldRows = (
+            [
+              ['vendor', ex.vendor],
+              ['registration_number', ex.registration_number],
+              ['tax_rate', ex.tax_rate],
+              ['receipt_no', ex.receipt_no],
+              ['note', ex.note],
+              ['date', ex.date],
+              ['total_incl_tax', total],
+              ['tax_amount', tax],
+            ] as [string, unknown][]
+          )
+            .filter(([, v]) => v !== null && v !== undefined && v !== '')
+            .map(([field_name, value]) => ({
+              receipt_id: receipt?.id ?? null,
+              field_name,
+              field_value: String(value),
+              confidence: conf,
+              source: 'claude-opus-4-8',
+            }));
+          if (fieldRows.length) await supabase.from('extracted_fields').insert(fieldRows);
+
+          await supabase
+            .from('processing_jobs')
+            .update({ status: 'done', finished_at: new Date().toISOString() })
+            .eq('id', job?.id);
+
+          if (ev.replyToken) {
+            const yen = total != null ? `¥${total.toLocaleString()}` : '金額不明';
+            await replyLineMessage(
+              ev.replyToken,
+              `登録しました。\n${ex.vendor ?? '店名不明'} / ${issued ?? '日付不明'} / ${yen}`,
+            );
+          }
+        } catch (exErr) {
+          console.error('Extraction error:', exErr);
+          await supabase
+            .from('processing_jobs')
+            .update({ status: 'failed', error: String(exErr), finished_at: new Date().toISOString() })
+            .eq('id', job?.id);
+          if (ev.replyToken) {
+            await replyLineMessage(
+              ev.replyToken,
+              '画像を受け取り保存しました。（解析でエラーが出たため後ほど再処理します）',
+            );
+          }
         }
       }
     } catch (err) {
