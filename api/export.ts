@@ -137,11 +137,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     // 領収書・請求書（および種別未指定の通帳以外）
     const header = [
       '受信日時', '顧問先ID', '顧問先', '売上経費', '種別', '日付', '取引先', '発行元', '宛名',
-      '税込金額', '消費税', '手数料', '税率', '登録番号', '番号', '但し書き', '要確認', '検算メモ',
+      '税込金額', '消費税', '手数料', '税率', '税目', '対象期間', '登録番号', '番号', '但し書き', '要確認', '検算メモ',
     ];
     const dirLabel = (dir: unknown) => (dir === 'sales' ? '売上' : dir === 'expense' ? '経費' : '');
     const body = filtered
-      .filter((r) => r.document_type !== 'bankbook')
+      .filter((r) => r.document_type !== 'bankbook' && r.document_type !== 'credit_card')
       .map((r) => {
         const f = fieldsByRec[r.id] ?? {};
         return [
@@ -149,6 +149,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           DOC_LABEL[r.document_type as string] ?? r.document_type ?? '',
           fmtDate(r.issued_date), f['counterparty'] ?? f['vendor'] ?? '', f['vendor'] ?? '', f['recipient'] ?? '',
           r.total_amount ?? '', r.tax_amount ?? '', f['fee'] ?? '', f['tax_rate'] ?? '',
+          f['tax_kind'] ?? '', f['period'] ?? '',
           f['registration_number'] ?? '', f['receipt_no'] ?? '', f['note'] ?? '',
           f['needs_review'] === 'true' ? '要確認' : '', f['validation_notes'] ?? '',
         ];

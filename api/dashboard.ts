@@ -17,6 +17,7 @@ const DOC_LABEL: Record<string, string> = {
   invoice: '請求書',
   bankbook: '通帳',
   credit_card: 'カード明細',
+  tax_payment: '納付書',
   other: 'その他',
 };
 const DOC_COLOR: Record<string, string> = {
@@ -24,6 +25,7 @@ const DOC_COLOR: Record<string, string> = {
   invoice: '#7c3aed',
   bankbook: '#0d9488',
   credit_card: '#db2777',
+  tax_payment: '#ea580c',
   other: '#6b7280',
 };
 
@@ -179,6 +181,8 @@ function renderCard(r: Row, d: Awaited<ReturnType<typeof loadData>>): string {
     const taxRate = fields['tax_rate'];
     const note = fields['note'];
     const fee = fields['fee'];
+    const taxKind = fields['tax_kind'];
+    const period = fields['period'];
     body = `
       <div class="meta">
         <span class="vendor">${esc(counterparty)}</span>
@@ -186,6 +190,8 @@ function renderCard(r: Row, d: Awaited<ReturnType<typeof loadData>>): string {
       </div>
       <div class="amount">${yen(r.total_amount) || '金額不明'}${fee ? `<span class="fee">手数料 ${yen(fee)}</span>` : ''}</div>
       <div class="sub">
+        ${taxKind ? `<span class="taxkind">${esc(taxKind)}</span>` : ''}
+        ${period ? `<span>${esc(period)}</span>` : ''}
         ${r.tax_amount != null ? `<span>税 ${yen(r.tax_amount)}</span>` : ''}
         ${taxRate ? `<span>${esc(taxRate)}</span>` : ''}
         ${reg ? `<span>登録番号 ${esc(reg)}</span>` : ''}
@@ -290,6 +296,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     ['', 'すべて'],
     ['receipt', '領収書'],
     ['invoice', '請求書'],
+    ['tax_payment', '納付書'],
     ['credit_card', 'カード'],
     ['bankbook', '通帳'],
   ];
@@ -395,7 +402,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   .date { color:var(--muted); font-size:.85rem; }
   .amount { font-size:1.5rem; font-weight:800; margin:4px 0; letter-spacing:.02em; }
   .amount .fee { font-size:.8rem; font-weight:600; color:var(--muted); margin-left:10px; }
-  .sub { display:flex; gap:12px; flex-wrap:wrap; color:var(--muted); font-size:.82rem; }
+  .sub { display:flex; gap:12px; flex-wrap:wrap; color:var(--muted); font-size:.82rem; align-items:center; }
+  .sub .taxkind { color:#9a3412; background:#ffedd5; font-weight:700; padding:1px 8px; border-radius:999px; }
   .note { margin-top:5px; font-size:.85rem; color:#334155; }
   .notes { margin-top:6px; font-size:.8rem; color:#b45309; background:#fffbeb; border:1px solid #fde68a; border-radius:8px; padding:5px 9px; }
   .received { margin-top:8px; font-size:.72rem; color:#94a3b8; }
