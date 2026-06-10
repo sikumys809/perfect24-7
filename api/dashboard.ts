@@ -202,34 +202,103 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return res.status(500).send('<!doctype html><meta charset="utf-8"><body style="font-family:sans-serif;padding:2rem">データ取得でエラーが発生しました。</body>');
   }
 
+  // フィルタ用パラメータ
+  const showAll = req.query.all === '1';
+  const fType = typeof req.query.type === 'string' ? req.query.type : '';
+  const fClient = typeof req.query.client === 'string' ? req.query.client : '';
+  const fq = (typeof req.query.q === 'string' ? req.query.q : '').trim();
+  const key = typeof req.query.key === 'string' ? req.query.key : '';
+
+  // 現在のフィルタを維持したままパラメータを差し替えるURLを作る
+  const withParams = (ov: { type?: string; client?: string; q?: string }) => {
+    const p = new URLSearchParams();
+    const t = ov.type !== undefined ? ov.type : fType;
+    const c = ov.client !== undefined ? ov.client : fClient;
+    const q = ov.q !== undefined ? ov.q : fq;
+    if (t) p.set('type', t);
+    if (c) p.set('client', c);
+    if (q) p.set('q', q);
+    if (showAll) p.set('all', '1');
+    if (key) p.set('key', key);
+    const s = p.toString();
+    return s ? '?' + s : '';
+  };
+
   // 解析できた書類だけを表示（?all=1 で未処理・空カードも含め全件表示）。
   // 判定: 通帳 / 金額あり / 取引先ありのいずれか＝意味のある抽出ができている
-  const showAll = req.query.all === '1';
   const isMeaningful = (r: Row) =>
     r.document_type === 'bankbook' ||
     r.total_amount != null ||
     Boolean(d.fieldsByRec[r.id]?.['vendor']);
-  const displayRecs = showAll ? d.recs : d.recs.filter(isMeaningful);
-  const hiddenCount = d.recs.length - displayRecs.length;
+  const meaningfulRecs = showAll ? d.recs : d.recs.filter(isMeaningful);
+  const hiddenCount = showAll ? 0 : d.recs.length - meaningfulRecs.length;
 
-  const counts = displayRecs.reduce<Record<string, number>>((m, r) => {
-    const k = r.document_type ?? 'other';
-    m[k] = (m[k] ?? 0) + 1;
-    return m;
-  }, {});
+  // 種別・顧問先・取引先検索で絞り込み
+  let displayRecs = meaningfulRecs;
+  if (fType) displayRecs = displayRecs.filter((r) => (r.document_type ?? 'other') === fType);
+  if (fClient) displayRecs = displayRecs.filter((r) => r.client_id === fClient);
+  if (fq) {
+    const ql = fq.toLowerCase();
+    displayRecs = displayRecs.filter((r) =>
+      String(d.fieldsByRec[r.id]?.['vendor'] ?? '').toLowerCase().includes(ql),
+    );
+  }
+
   const reviewCount = displayRecs.filter((r) => d.fieldsByRec[r.id]?.['needs_review'] === 'true').length;
+
+  // 種別タブ（件数つき）
+  const typeDefs: [string, string][] = [
+    ['', 'すべて'],
+    ['receipt', '領収書'],
+    ['invoice', '請求書'],
+    ['bankbook', '通帳'],
+  ];
+  const typeTabs = typeDefs
+    .map(([val, label]) => {
+      const n =
+        val === '' ? meaningfulRecs.length : meaningfulRecs.filter((r) => (r.document_type ?? 'other') === val).length;
+      const active = fType === val ? ' active' : '';
+      return `<a class="tab${active}" href="${withParams({ type: val })}">${esc(label)} <b>${n}</b></a>`;
+    })
+    .join('');
+
+  // 顧問先ドロップダウン（書類のある顧問先のみ）
+  const clients = Object.values(d.clientById).sort((a, b) =>
+    String(a.client_code).localeCompare(String(b.client_code)),
+  );
+  const clientOptions = [
+    `<option value="">全顧問先</option>`,
+    ...clients.map(
+      (c) => `<option value="${esc(c.id)}"${fClient === c.id ? ' selected' : ''}>${esc(c.official_name)}</option>`,
+    ),
+  ].join('');
+
+  const filterBar = `
+  <div class="filterbar">
+    <div class="tabs">${typeTabs}</div>
+    <form class="filters" method="get">
+      ${key ? `<input type="hidden" name="key" value="${esc(key)}">` : ''}
+      ${fType ? `<input type="hidden" name="type" value="${esc(fType)}">` : ''}
+      ${showAll ? `<input type="hidden" name="all" value="1">` : ''}
+      <select name="client" onchange="this.form.submit()">${clientOptions}</select>
+      <input name="q" value="${esc(fq)}" placeholder="取引先で検索" autocomplete="off">
+      <button type="submit">検索</button>
+      ${fq || fClient ? `<a class="clear" href="${withParams({ client: '', q: '' })}">クリア</a>` : ''}
+    </form>
+    <a class="csv" href="/api/export${withParams({})}">⬇ CSVダウンロード（${displayRecs.length}）</a>
+  </div>`;
+
   const summary = [
     `${displayRecs.length} 件`,
-    ...Object.entries(counts).map(([k, n]) => `${DOC_LABEL[k] ?? k} ${n}`),
     reviewCount ? `⚠️要確認 ${reviewCount}` : '',
-    !showAll && hiddenCount ? `未処理 ${hiddenCount}件は非表示` : '',
+    hiddenCount ? `未処理 ${hiddenCount}件は非表示` : '',
   ]
     .filter(Boolean)
     .join(' ・ ');
 
   const cards = displayRecs.length
     ? displayRecs.map((r) => renderCard(r, d)).join('\n')
-    : '<div class="empty">まだ書類が届いていません。LINE で領収書・請求書・通帳を送ってください。</div>';
+    : '<div class="empty">該当する書類がありません。LINE で領収書・請求書・通帳を送ってください。</div>';
 
   const html = `<!doctype html>
 <html lang="ja"><head>
@@ -272,7 +341,18 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   table.txns td.desc { color:#334155; }
   table.txns tr.low td { background:#fffbeb; }
   .empty { text-align:center; color:var(--muted); padding:60px 20px; }
-  @media (max-width:560px){ .thumb{ flex-basis:84px } .thumb img,.thumb .pdf,.thumb .noimg{ width:84px;height:84px } .amount{ font-size:1.25rem } }
+  .filterbar { background:#fff; border-bottom:1px solid var(--line); padding:10px 16px; display:flex; gap:14px; align-items:center; flex-wrap:wrap; position:sticky; top:51px; z-index:9; }
+  .tabs { display:flex; gap:6px; flex-wrap:wrap; }
+  .tab { text-decoration:none; color:var(--muted); font-size:.85rem; padding:5px 12px; border-radius:999px; border:1px solid var(--line); }
+  .tab b { color:#94a3b8; font-weight:700; }
+  .tab.active { background:#0f172a; color:#fff; border-color:#0f172a; }
+  .tab.active b { color:#cbd5e1; }
+  .filters { display:flex; gap:6px; align-items:center; }
+  .filters select, .filters input { font-size:.85rem; padding:6px 9px; border:1px solid var(--line); border-radius:8px; background:#fff; }
+  .filters button { font-size:.85rem; padding:6px 12px; border:none; border-radius:8px; background:#2563eb; color:#fff; cursor:pointer; }
+  .filters .clear { font-size:.8rem; color:var(--muted); text-decoration:none; }
+  .csv { margin-left:auto; text-decoration:none; font-size:.85rem; font-weight:700; color:#0d9488; border:1px solid #5eead4; background:#f0fdfa; padding:7px 14px; border-radius:9px; }
+  @media (max-width:560px){ .thumb{ flex-basis:84px } .thumb img,.thumb .pdf,.thumb .noimg{ width:84px;height:84px } .amount{ font-size:1.25rem } .filterbar{ top:47px } .csv{ margin-left:0 } }
 </style>
 </head><body>
 <header>
@@ -280,6 +360,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   <span class="sum">${esc(summary)}</span>
   <span class="live">● 20秒ごとに自動更新</span>
 </header>
+${filterBar}
 <div class="wrap">
   ${cards}
 </div>
