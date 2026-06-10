@@ -8,8 +8,10 @@ import Anthropic from '@anthropic-ai/sdk';
 // 大きめPDFの解析に時間がかかるため実行上限を延長（Hobbyの上限60秒）
 export const config = { api: { bodyParser: false }, maxDuration: 60 };
 
-const LINE_CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET ?? '';
-const LINE_CHANNEL_ACCESS_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN ?? '';
+// マルチテナントのフォールバック。事務所ごとのトークンが DB(offices)に無い場合に使う
+// （検証中は1事務所＝env のトークンをそのまま使用）
+const ENV_LINE_CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET ?? '';
+const ENV_LINE_CHANNEL_ACCESS_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN ?? '';
 // supabase-js はベースURL (https://xxxx.supabase.co) を期待するため、
 // 末尾に "/rest/v1" が付いていても剥がして渡す
 const SUPABASE_URL = (process.env.SUPABASE_URL ?? '').replace(/\/rest\/v1\/?$/, '');
@@ -28,17 +30,17 @@ function readRawBody(req: VercelRequest): Promise<Buffer> {
   });
 }
 
-function verifyLineSignature(body: Buffer, signature: string | undefined): boolean {
-  if (!signature) return false;
-  const hash = crypto.createHmac('sha256', LINE_CHANNEL_SECRET).update(body).digest('base64');
+function verifyLineSignature(body: Buffer, signature: string | undefined, secret: string): boolean {
+  if (!signature || !secret) return false;
+  const hash = crypto.createHmac('sha256', secret).update(body).digest('base64');
   const a = Buffer.from(hash);
   const b = Buffer.from(signature);
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
-async function fetchLineContent(messageId: string) {
+async function fetchLineContent(accessToken: string, messageId: string) {
   const res = await fetch(`https://api-data.line.me/v2/bot/message/${messageId}/content`, {
-    headers: { Authorization: `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}` },
+    headers: { Authorization: `Bearer ${accessToken}` },
   });
   if (!res.ok) throw new Error(`Failed to fetch content: ${res.status}`);
   const arrayBuffer = await res.arrayBuffer();
@@ -46,12 +48,12 @@ async function fetchLineContent(messageId: string) {
   return { buffer: Buffer.from(arrayBuffer), contentType };
 }
 
-async function replyLineMessage(replyToken: string, text: string) {
+async function replyLineMessage(accessToken: string, replyToken: string, text: string) {
   await fetch('https://api.line.me/v2/bot/message/reply', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      Authorization: `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}`,
+      Authorization: `Bearer ${accessToken}`,
     },
     body: JSON.stringify({ replyToken, messages: [{ type: 'text', text }] }),
   });
@@ -246,18 +248,27 @@ type SaveCtx = {
   imageHash: string | null; // 重複弾き用ハッシュ。代表1件のみ付与、他は null
   docType?: string | null; // receipt / invoice / bankbook / other
   clientId?: string | null; // どの顧問先の書類か
+  officeId?: string | null; // どの事務所宛か（未解決=null。後方互換のため null なら列を付けない）
 };
+
+// receipts への共通 INSERT 値を組み立てる。office_id は解決済みのときだけ付与し、
+// マイグレーション未適用（office_id 列なし）でも壊れないようにする
+function receiptInsertValues(ctx: SaveCtx, docType: string | null) {
+  const base: Record<string, unknown> = {
+    original_filename: ctx.messageId,
+    source: 'LINE',
+    document_type: docType,
+    client_id: ctx.clientId ?? null,
+  };
+  if (ctx.officeId) base.office_id = ctx.officeId;
+  return base;
+}
 
 // 抽出1件分を保存し、返信用サマリ行を返す
 async function saveReceipt(ex: any, ctx: SaveCtx): Promise<string> {
   const { data: receipt } = await supabase
     .from('receipts')
-    .insert({
-      original_filename: ctx.messageId,
-      source: 'LINE',
-      document_type: ctx.docType ?? null,
-      client_id: ctx.clientId ?? null,
-    })
+    .insert(receiptInsertValues(ctx, ctx.docType ?? null))
     .select()
     .single();
 
@@ -347,12 +358,7 @@ async function saveBankTransactions(
 ): Promise<{ count: number; validation: ReturnType<typeof validateBankTransactions> }> {
   const { data: receipt } = await supabase
     .from('receipts')
-    .insert({
-      original_filename: ctx.messageId,
-      source: 'LINE',
-      document_type: 'bankbook',
-      client_id: ctx.clientId ?? null,
-    })
+    .insert(receiptInsertValues(ctx, 'bankbook'))
     .select()
     .single();
 
@@ -414,11 +420,7 @@ async function saveBankTransactions(
 async function saveUnprocessed(ctx: Omit<SaveCtx, 'imageHash'>, errorText: string) {
   const { data: r } = await supabase
     .from('receipts')
-    .insert({
-      original_filename: ctx.messageId,
-      source: 'LINE',
-      client_id: ctx.clientId ?? null,
-    })
+    .insert(receiptInsertValues({ ...ctx, imageHash: null }, ctx.docType ?? null))
     .select()
     .single();
   await supabase.from('receipt_images').insert({
@@ -440,25 +442,57 @@ async function saveUnprocessed(ctx: Omit<SaveCtx, 'imageHash'>, errorText: strin
 const WELCOME_MESSAGE =
   'ご登録ありがとうございます。\nご利用には顧問先登録が必要です。事務所からお伝えした「登録コード」をこのトークに送信してください。\n登録後は領収書・請求書・通帳の画像/PDFを送るだけで自動で記帳されます。';
 
-// LINE userId から登録済み顧問先を引く（未登録なら null）
-async function findClientByLineUser(lineUserId: string) {
-  const { data } = await supabase
+// 1リクエスト（=1事務所宛）の処理コンテキスト。署名検証後に確定する
+type ReqCtx = { accessToken: string; officeId: string | null };
+
+type Office = {
+  id: string;
+  name: string;
+  line_channel_secret: string | null;
+  line_channel_access_token: string | null;
+};
+
+// webhook payload の destination（botのuserID）から事務所を引く。
+// offices テーブルが未作成（マイグレーション未適用）でも落ちないよう握りつぶして null を返す
+// ＝その場合は env のトークンで従来どおり単一事務所として動作する。
+async function findOfficeByDestination(destination: string | null): Promise<Office | null> {
+  if (!destination) return null;
+  try {
+    const { data, error } = await supabase
+      .from('offices')
+      .select('id, name, line_channel_secret, line_channel_access_token')
+      .eq('line_destination', destination)
+      .eq('is_active', true)
+      .limit(1);
+    if (error) return null;
+    return data && data.length > 0 ? (data[0] as Office) : null;
+  } catch {
+    return null;
+  }
+}
+
+// LINE userId から登録済み顧問先を引く（未登録なら null）。
+// 事務所が解決済みなら、その事務所の顧問先に限定する（マルチテナント分離）
+async function findClientByLineUser(lineUserId: string, officeId: string | null) {
+  let q = supabase
     .from('clients')
     .select('id, client_code, official_name')
-    .eq('linked_line_user_id', lineUserId)
-    .limit(1);
+    .eq('linked_line_user_id', lineUserId);
+  if (officeId) q = q.eq('office_id', officeId);
+  const { data } = await q.limit(1);
   return data && data.length > 0 ? data[0] : null;
 }
 
 // テキスト（=登録コード想定）を処理して顧問先をひもづける
-async function handleRegistration(ev: any, lineUserId: string | null) {
+async function handleRegistration(ev: any, lineUserId: string | null, ctx: ReqCtx) {
   if (!lineUserId) return;
 
   // 既にひもづいていれば案内のみ
-  const existing = await findClientByLineUser(lineUserId);
+  const existing = await findClientByLineUser(lineUserId, ctx.officeId);
   if (existing) {
     if (ev.replyToken) {
       await replyLineMessage(
+        ctx.accessToken,
         ev.replyToken,
         `${existing.official_name} 様として登録済みです（顧問先ID: ${existing.client_code}）。\n領収書・請求書・通帳を送ってください。`,
       );
@@ -468,18 +502,20 @@ async function handleRegistration(ev: any, lineUserId: string | null) {
 
   const code = String(ev.message?.text ?? '').trim().toUpperCase();
 
-  // 未ひもづけの顧問先を登録コードで検索
-  const { data } = await supabase
+  // 未ひもづけの顧問先を登録コードで検索（事務所が解決済みならその事務所内に限定）
+  let q = supabase
     .from('clients')
     .select('id, client_code, official_name')
     .eq('registration_code', code)
-    .is('linked_line_user_id', null)
-    .limit(1);
+    .is('linked_line_user_id', null);
+  if (ctx.officeId) q = q.eq('office_id', ctx.officeId);
+  const { data } = await q.limit(1);
   const client = data && data.length > 0 ? data[0] : null;
 
   if (!client) {
     if (ev.replyToken) {
       await replyLineMessage(
+        ctx.accessToken,
         ev.replyToken,
         '登録コードが正しくないか、既に使用済みです。事務所にご確認ください。',
       );
@@ -499,17 +535,22 @@ async function handleRegistration(ev: any, lineUserId: string | null) {
   if (ev.replyToken) {
     if (updated && updated.length > 0) {
       await replyLineMessage(
+        ctx.accessToken,
         ev.replyToken,
         `${client.official_name} 様、登録が完了しました（顧問先ID: ${client.client_code}）。\n領収書・請求書・通帳の画像/PDFを送ってください。`,
       );
     } else {
-      await replyLineMessage(ev.replyToken, 'この登録コードは既に使用済みです。事務所にご確認ください。');
+      await replyLineMessage(
+        ctx.accessToken,
+        ev.replyToken,
+        'この登録コードは既に使用済みです。事務所にご確認ください。',
+      );
     }
   }
 }
 
-// 200を返した後にバックグラウンドで実行される処理
-async function processWebhookEvents(bodyText: string) {
+// 200を返した後にバックグラウンドで実行される処理。ctx は署名検証で確定した事務所の文脈
+async function processWebhookEvents(bodyText: string, ctx: ReqCtx) {
   const payload = JSON.parse(bodyText);
   const events = payload.events || [];
 
@@ -519,7 +560,7 @@ async function processWebhookEvents(bodyText: string) {
 
       // 友達追加：登録の案内を返す
       if (ev.type === 'follow') {
-        if (ev.replyToken) await replyLineMessage(ev.replyToken, WELCOME_MESSAGE);
+        if (ev.replyToken) await replyLineMessage(ctx.accessToken, ev.replyToken, WELCOME_MESSAGE);
         continue;
       }
 
@@ -528,27 +569,31 @@ async function processWebhookEvents(bodyText: string) {
 
       // テキストは登録コードとして処理
       if (msgType === 'text') {
-        await handleRegistration(ev, lineUserId);
+        await handleRegistration(ev, lineUserId, ctx);
         continue;
       }
 
       if (msgType !== 'image' && msgType !== 'file') continue;
 
       // 書類は登録済み顧問先のみ受付（未登録は登録を促す）
-      const client = lineUserId ? await findClientByLineUser(lineUserId) : null;
+      const client = lineUserId ? await findClientByLineUser(lineUserId, ctx.officeId) : null;
       if (!client) {
-        if (ev.replyToken) await replyLineMessage(ev.replyToken, WELCOME_MESSAGE);
+        if (ev.replyToken) await replyLineMessage(ctx.accessToken, ev.replyToken, WELCOME_MESSAGE);
         continue;
       }
 
       const messageId = ev.message.id;
-      const { buffer, contentType } = await fetchLineContent(messageId);
+      const { buffer, contentType } = await fetchLineContent(ctx.accessToken, messageId);
 
       const isPdf = contentType.includes('pdf');
       const isImage = contentType.startsWith('image/');
       if (!isPdf && !isImage) {
         if (ev.replyToken) {
-          await replyLineMessage(ev.replyToken, '対応していない形式です（画像かPDFを送ってください）。');
+          await replyLineMessage(
+            ctx.accessToken,
+            ev.replyToken,
+            '対応していない形式です（画像かPDFを送ってください）。',
+          );
         }
         continue;
       }
@@ -561,7 +606,8 @@ async function processWebhookEvents(bodyText: string) {
         .eq('image_sha256', fileHash)
         .limit(1);
       if (dup && dup.length > 0) {
-        if (ev.replyToken) await replyLineMessage(ev.replyToken, 'この画像は既に受信済みです。');
+        if (ev.replyToken)
+          await replyLineMessage(ctx.accessToken, ev.replyToken, 'この画像は既に受信済みです。');
         continue;
       }
 
@@ -573,7 +619,13 @@ async function processWebhookEvents(bodyText: string) {
         .upload(path, buffer, { contentType });
       if (uploadError) throw uploadError;
 
-      const ctx = { messageId, path, contentType, clientId: client.id };
+      const saveCtx = {
+        messageId,
+        path,
+        contentType,
+        clientId: client.id,
+        officeId: ctx.officeId,
+      };
 
       // 抽出（複数件）
       let doc: any;
@@ -581,9 +633,10 @@ async function processWebhookEvents(bodyText: string) {
         doc = await extractDocument(buffer, contentType);
       } catch (exErr) {
         console.error('Extraction error:', exErr);
-        await saveUnprocessed(ctx, String(exErr));
+        await saveUnprocessed(saveCtx, String(exErr));
         if (ev.replyToken) {
           await replyLineMessage(
+            ctx.accessToken,
             ev.replyToken,
             'ファイルを受け取り保存しました。（解析でエラーが出たため後ほど再処理します）',
           );
@@ -599,14 +652,18 @@ async function processWebhookEvents(bodyText: string) {
           ? doc.transactions.filter((t: any) => t && typeof t === 'object')
           : [];
         if (txns.length === 0) {
-          await saveUnprocessed(ctx, 'no_transactions_found');
+          await saveUnprocessed({ ...saveCtx, docType }, 'no_transactions_found');
           if (ev.replyToken) {
-            await replyLineMessage(ev.replyToken, '通帳から読み取れる取引明細が見つかりませんでした。');
+            await replyLineMessage(
+              ctx.accessToken,
+              ev.replyToken,
+              '通帳から読み取れる取引明細が見つかりませんでした。',
+            );
           }
           continue;
         }
         const { count, validation } = await saveBankTransactions(txns, {
-          ...ctx,
+          ...saveCtx,
           imageHash: fileHash,
           docType,
         });
@@ -614,7 +671,11 @@ async function processWebhookEvents(bodyText: string) {
           const warn = validation.badLines.length
             ? `\n⚠️ ${validation.badLines.join(', ')}行目の残高が合いません（金額の誤読の可能性。要確認）`
             : '';
-          await replyLineMessage(ev.replyToken, `通帳を登録しました（明細${count}件）${warn}`);
+          await replyLineMessage(
+            ctx.accessToken,
+            ev.replyToken,
+            `通帳を登録しました（明細${count}件）${warn}`,
+          );
         }
         continue;
       }
@@ -625,9 +686,10 @@ async function processWebhookEvents(bodyText: string) {
         : [];
 
       if (receipts.length === 0) {
-        await saveUnprocessed(ctx, 'no_receipts_found');
+        await saveUnprocessed({ ...saveCtx, docType }, 'no_receipts_found');
         if (ev.replyToken) {
           await replyLineMessage(
+            ctx.accessToken,
             ev.replyToken,
             '読み取れるレシート/領収書/請求書が見つかりませんでした。',
           );
@@ -639,7 +701,7 @@ async function processWebhookEvents(bodyText: string) {
       const summaries: string[] = [];
       for (let i = 0; i < receipts.length; i++) {
         const summary = await saveReceipt(receipts[i], {
-          ...ctx,
+          ...saveCtx,
           imageHash: i === 0 ? fileHash : null,
           docType,
         });
@@ -649,7 +711,7 @@ async function processWebhookEvents(bodyText: string) {
       if (ev.replyToken) {
         const head =
           receipts.length > 1 ? `登録しました（${receipts.length}件）\n` : '登録しました。\n';
-        await replyLineMessage(ev.replyToken, head + summaries.join('\n'));
+        await replyLineMessage(ctx.accessToken, ev.replyToken, head + summaries.join('\n'));
       }
     } catch (err) {
       console.error('Event processing error:', err);
@@ -666,12 +728,28 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const rawBody = await readRawBody(req);
     const signature = req.headers['x-line-signature'] as string | undefined;
 
-    if (!verifyLineSignature(rawBody, signature)) {
+    // 署名検証に使う事務所を特定するため、まず未検証のまま destination を読む。
+    // （destination でチャネルを選び、その秘密で署名検証する＝偽造は秘密が無いと不可能）
+    let destination: string | null = null;
+    try {
+      destination = JSON.parse(rawBody.toString('utf8'))?.destination ?? null;
+    } catch {
+      /* JSON でなければ destination なし→env にフォールバック */
+    }
+    const office = await findOfficeByDestination(destination);
+
+    // 事務所ごとのトークンが DB にあればそれを、無ければ env を使う（検証中は env）
+    const secret = office?.line_channel_secret || ENV_LINE_CHANNEL_SECRET;
+    const accessToken = office?.line_channel_access_token || ENV_LINE_CHANNEL_ACCESS_TOKEN;
+
+    if (!verifyLineSignature(rawBody, signature, secret)) {
       return res.status(401).send('Invalid signature');
     }
 
     // 200を即返し、保存処理は裏で最後までやりきる
-    waitUntil(processWebhookEvents(rawBody.toString('utf8')));
+    waitUntil(
+      processWebhookEvents(rawBody.toString('utf8'), { accessToken, officeId: office?.id ?? null }),
+    );
     return res.status(200).send('OK');
   } catch (err) {
     console.error('Webhook handler error', err);
