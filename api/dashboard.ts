@@ -180,7 +180,7 @@ function renderCard(r: Row, d: Awaited<ReturnType<typeof loadData>>): string {
       </div>
       ${body}
       ${needsReview && notes ? `<div class="notes">${esc(notes)}</div>` : ''}
-      <div class="received">受信: ${esc(new Date(r.created_at).toLocaleString('ja-JP'))}</div>
+      <div class="received">受信: ${esc(new Date(r.created_at).toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' }))}</div>
     </div>
   </div>`;
 }
