@@ -1,0 +1,282 @@
+import type { VercelRequest, VercelResponse } from '@vercel/node';
+import { createClient } from '@supabase/supabase-js';
+
+// 事務所向けの読み取り専用ダッシュボード。
+// LINE で届いた書類が「整理済み」で並ぶ様子をその場で見せるための簡易ビュー。
+// 認証: DASHBOARD_KEY を設定すると ?key= 必須。未設定なら誰でも閲覧可（デモ用・要注意）。
+export const config = { maxDuration: 30 };
+
+const SUPABASE_URL = (process.env.SUPABASE_URL ?? '').replace(/\/rest\/v1\/?$/, '');
+const SUPABASE_KEY = process.env.SUPABASE_KEY ?? '';
+const DASHBOARD_KEY = process.env.DASHBOARD_KEY ?? '';
+
+const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+
+const DOC_LABEL: Record<string, string> = {
+  receipt: '領収書',
+  invoice: '請求書',
+  bankbook: '通帳',
+  other: 'その他',
+};
+const DOC_COLOR: Record<string, string> = {
+  receipt: '#2563eb',
+  invoice: '#7c3aed',
+  bankbook: '#0d9488',
+  other: '#6b7280',
+};
+
+function esc(s: unknown): string {
+  return String(s ?? '').replace(
+    /[&<>"']/g,
+    (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c] as string,
+  );
+}
+function yen(n: unknown): string {
+  if (n === null || n === undefined || n === '') return '';
+  const v = Number(n);
+  return Number.isNaN(v) ? '' : '¥' + v.toLocaleString();
+}
+function fmtDate(d: unknown): string {
+  return typeof d === 'string' && d ? d.slice(0, 10) : '—';
+}
+
+type Row = Record<string, any>;
+
+async function loadData() {
+  // 最新100件の書類
+  const { data: receipts } = await supabase
+    .from('receipts')
+    .select('id, document_type, total_amount, tax_amount, amount, issued_date, created_at, client_id, office_id')
+    .order('created_at', { ascending: false })
+    .limit(100);
+  const recs: Row[] = receipts ?? [];
+  if (recs.length === 0) return { recs, fieldsByRec: {}, imgByRec: {}, txnByRec: {}, clientById: {}, officeById: {}, signed: {} };
+
+  const ids = recs.map((r) => r.id);
+  const clientIds = [...new Set(recs.map((r) => r.client_id).filter(Boolean))];
+  const officeIds = [...new Set(recs.map((r) => r.office_id).filter(Boolean))];
+
+  const [fieldsRes, imgRes, txnRes, clientRes, officeRes] = await Promise.all([
+    supabase.from('extracted_fields').select('receipt_id, field_name, field_value').in('receipt_id', ids),
+    supabase.from('receipt_images').select('receipt_id, storage_path, content_type').in('receipt_id', ids),
+    supabase
+      .from('bank_transactions')
+      .select('receipt_id, line_no, txn_date, description, withdrawal, deposit, balance, confidence')
+      .in('receipt_id', ids)
+      .order('line_no', { ascending: true }),
+    clientIds.length
+      ? supabase.from('clients').select('id, client_code, official_name').in('id', clientIds)
+      : Promise.resolve({ data: [] as Row[] }),
+    officeIds.length
+      ? supabase.from('offices').select('id, office_code, name').in('id', officeIds)
+      : Promise.resolve({ data: [] as Row[] }),
+  ]);
+
+  // receipt_id ごとに項目をまとめる
+  const fieldsByRec: Record<string, Record<string, string>> = {};
+  for (const f of fieldsRes.data ?? []) {
+    (fieldsByRec[f.receipt_id] ??= {})[f.field_name] = f.field_value;
+  }
+  const imgByRec: Record<string, Row> = {};
+  for (const im of imgRes.data ?? []) {
+    imgByRec[im.receipt_id] ??= im; // 代表1枚
+  }
+  const txnByRec: Record<string, Row[]> = {};
+  for (const t of txnRes.data ?? []) {
+    (txnByRec[t.receipt_id] ??= []).push(t);
+  }
+  const clientById: Record<string, Row> = {};
+  for (const c of clientRes.data ?? []) clientById[c.id] = c;
+  const officeById: Record<string, Row> = {};
+  for (const o of officeRes.data ?? []) officeById[o.id] = o;
+
+  // 画像の署名URL（非公開バケットを安全に表示。1時間有効）
+  const paths = Object.values(imgByRec)
+    .map((im) => im.storage_path)
+    .filter(Boolean);
+  const signed: Record<string, string> = {};
+  if (paths.length) {
+    const { data: signedList } = await supabase.storage.from('receipts').createSignedUrls(paths, 3600);
+    for (const s of signedList ?? []) {
+      if (s.path && s.signedUrl) signed[s.path] = s.signedUrl;
+    }
+  }
+
+  return { recs, fieldsByRec, imgByRec, txnByRec, clientById, officeById, signed };
+}
+
+function renderCard(r: Row, d: Awaited<ReturnType<typeof loadData>>): string {
+  const fields = d.fieldsByRec[r.id] ?? {};
+  const img = d.imgByRec[r.id];
+  const signedUrl = img ? d.signed[img.storage_path] : undefined;
+  const isImage = (img?.content_type ?? '').startsWith('image/');
+  const client = r.client_id ? d.clientById[r.client_id] : null;
+
+  const docType = r.document_type ?? 'other';
+  const label = DOC_LABEL[docType] ?? docType ?? '未判定';
+  const color = DOC_COLOR[docType] ?? '#6b7280';
+
+  const needsReview = fields['needs_review'] === 'true';
+  const notes = fields['validation_notes'];
+
+  // サムネイル
+  let thumb: string;
+  if (signedUrl && isImage) {
+    thumb = `<a href="${esc(signedUrl)}" target="_blank" rel="noopener"><img src="${esc(signedUrl)}" alt="receipt" loading="lazy"></a>`;
+  } else if (signedUrl) {
+    thumb = `<a class="pdf" href="${esc(signedUrl)}" target="_blank" rel="noopener">📄 PDFを開く</a>`;
+  } else {
+    thumb = `<div class="noimg">画像なし</div>`;
+  }
+
+  // 本文
+  let body: string;
+  if (docType === 'bankbook') {
+    const txns = d.txnByRec[r.id] ?? [];
+    const rows = txns
+      .map(
+        (t) => `<tr${(t.confidence != null && Number(t.confidence) < 0.7) ? ' class="low"' : ''}>
+        <td>${esc(fmtDate(t.txn_date))}</td>
+        <td class="desc">${esc(t.description ?? '')}</td>
+        <td class="num">${yen(t.withdrawal)}</td>
+        <td class="num">${yen(t.deposit)}</td>
+        <td class="num">${yen(t.balance)}</td></tr>`,
+      )
+      .join('');
+    body = `
+      <div class="meta"><span class="vendor">通帳 明細 ${txns.length} 件</span></div>
+      <table class="txns">
+        <thead><tr><th>日付</th><th>摘要</th><th>出金</th><th>入金</th><th>残高</th></tr></thead>
+        <tbody>${rows || '<tr><td colspan="5">明細なし</td></tr>'}</tbody>
+      </table>`;
+  } else {
+    const vendor = fields['vendor'] ?? '取引先不明';
+    const reg = fields['registration_number'];
+    const taxRate = fields['tax_rate'];
+    const note = fields['note'];
+    const fee = fields['fee'];
+    body = `
+      <div class="meta">
+        <span class="vendor">${esc(vendor)}</span>
+        <span class="date">${esc(fmtDate(r.issued_date))}</span>
+      </div>
+      <div class="amount">${yen(r.total_amount) || '金額不明'}${fee ? `<span class="fee">手数料 ${yen(fee)}</span>` : ''}</div>
+      <div class="sub">
+        ${r.tax_amount != null ? `<span>税 ${yen(r.tax_amount)}</span>` : ''}
+        ${taxRate ? `<span>${esc(taxRate)}</span>` : ''}
+        ${reg ? `<span>登録番号 ${esc(reg)}</span>` : ''}
+      </div>
+      ${note ? `<div class="note">${esc(note)}</div>` : ''}`;
+  }
+
+  return `
+  <div class="card">
+    <div class="thumb">${thumb}</div>
+    <div class="info">
+      <div class="top">
+        <span class="badge" style="background:${color}">${esc(label)}</span>
+        ${client ? `<span class="client">${esc(client.official_name)} <small>${esc(client.client_code)}</small></span>` : ''}
+        ${needsReview ? `<span class="review">⚠️ 要確認</span>` : ''}
+      </div>
+      ${body}
+      ${needsReview && notes ? `<div class="notes">${esc(notes)}</div>` : ''}
+      <div class="received">受信: ${esc(new Date(r.created_at).toLocaleString('ja-JP'))}</div>
+    </div>
+  </div>`;
+}
+
+export default async function handler(req: VercelRequest, res: VercelResponse) {
+  // 簡易アクセス保護
+  const keyEnforced = DASHBOARD_KEY.length > 0;
+  if (keyEnforced && req.query.key !== DASHBOARD_KEY) {
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    return res.status(401).send('<!doctype html><meta charset="utf-8"><body style="font-family:sans-serif;padding:2rem">アクセスキーが必要です（?key=...）。</body>');
+  }
+
+  let d: Awaited<ReturnType<typeof loadData>>;
+  try {
+    d = await loadData();
+  } catch (err) {
+    console.error('dashboard load error', err);
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    return res.status(500).send('<!doctype html><meta charset="utf-8"><body style="font-family:sans-serif;padding:2rem">データ取得でエラーが発生しました。</body>');
+  }
+
+  const counts = d.recs.reduce<Record<string, number>>((m, r) => {
+    const k = r.document_type ?? 'other';
+    m[k] = (m[k] ?? 0) + 1;
+    return m;
+  }, {});
+  const reviewCount = d.recs.filter((r) => d.fieldsByRec[r.id]?.['needs_review'] === 'true').length;
+  const summary = [
+    `${d.recs.length} 件`,
+    ...Object.entries(counts).map(([k, n]) => `${DOC_LABEL[k] ?? k} ${n}`),
+    reviewCount ? `⚠️要確認 ${reviewCount}` : '',
+  ]
+    .filter(Boolean)
+    .join(' ・ ');
+
+  const cards = d.recs.length
+    ? d.recs.map((r) => renderCard(r, d)).join('\n')
+    : '<div class="empty">まだ書類が届いていません。LINE で領収書・請求書・通帳を送ってください。</div>';
+
+  const keyParam = keyEnforced ? `?key=${encodeURIComponent(String(req.query.key))}` : '';
+
+  const html = `<!doctype html>
+<html lang="ja"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="refresh" content="20">
+<title>証憑ダッシュボード｜パーフェクト24/7</title>
+<style>
+  :root { --bg:#f1f5f9; --card:#fff; --line:#e2e8f0; --text:#0f172a; --muted:#64748b; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font-family:-apple-system,BlinkMacSystemFont,"Hiragino Kaku Gothic ProN","Noto Sans JP",sans-serif; }
+  header { position:sticky; top:0; background:#0f172a; color:#fff; padding:14px 18px; display:flex; align-items:baseline; gap:14px; flex-wrap:wrap; z-index:10; }
+  header h1 { font-size:1.05rem; margin:0; font-weight:700; }
+  header .sum { color:#cbd5e1; font-size:.85rem; }
+  header .live { margin-left:auto; font-size:.75rem; color:#34d399; }
+  .wrap { max-width:1100px; margin:0 auto; padding:16px; }
+  .card { display:flex; gap:14px; background:var(--card); border:1px solid var(--line); border-radius:14px; padding:14px; margin-bottom:12px; box-shadow:0 1px 2px rgba(0,0,0,.04); }
+  .thumb { flex:0 0 120px; }
+  .thumb img { width:120px; height:120px; object-fit:cover; border-radius:10px; border:1px solid var(--line); background:#f8fafc; }
+  .thumb .pdf, .thumb .noimg { width:120px; height:120px; display:flex; align-items:center; justify-content:center; border-radius:10px; border:1px dashed var(--line); color:var(--muted); font-size:.8rem; text-align:center; text-decoration:none; }
+  .info { flex:1; min-width:0; }
+  .top { display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin-bottom:6px; }
+  .badge { color:#fff; font-size:.72rem; font-weight:700; padding:2px 9px; border-radius:999px; }
+  .client { font-size:.85rem; color:var(--muted); }
+  .client small { color:#94a3b8; }
+  .review { color:#b45309; background:#fef3c7; font-size:.72rem; font-weight:700; padding:2px 8px; border-radius:999px; }
+  .meta { display:flex; align-items:baseline; gap:10px; flex-wrap:wrap; }
+  .vendor { font-size:1.05rem; font-weight:700; }
+  .date { color:var(--muted); font-size:.85rem; }
+  .amount { font-size:1.5rem; font-weight:800; margin:4px 0; letter-spacing:.02em; }
+  .amount .fee { font-size:.8rem; font-weight:600; color:var(--muted); margin-left:10px; }
+  .sub { display:flex; gap:12px; flex-wrap:wrap; color:var(--muted); font-size:.82rem; }
+  .note { margin-top:5px; font-size:.85rem; color:#334155; }
+  .notes { margin-top:6px; font-size:.8rem; color:#b45309; background:#fffbeb; border:1px solid #fde68a; border-radius:8px; padding:5px 9px; }
+  .received { margin-top:8px; font-size:.72rem; color:#94a3b8; }
+  table.txns { width:100%; border-collapse:collapse; margin-top:8px; font-size:.82rem; }
+  table.txns th { text-align:left; color:var(--muted); font-weight:600; border-bottom:1px solid var(--line); padding:4px 6px; }
+  table.txns td { border-bottom:1px solid #f1f5f9; padding:4px 6px; }
+  table.txns td.num { text-align:right; font-variant-numeric:tabular-nums; }
+  table.txns td.desc { color:#334155; }
+  table.txns tr.low td { background:#fffbeb; }
+  .empty { text-align:center; color:var(--muted); padding:60px 20px; }
+  @media (max-width:560px){ .thumb{ flex-basis:84px } .thumb img,.thumb .pdf,.thumb .noimg{ width:84px;height:84px } .amount{ font-size:1.25rem } }
+</style>
+</head><body>
+<header>
+  <h1>証憑ダッシュボード</h1>
+  <span class="sum">${esc(summary)}</span>
+  <span class="live">● 20秒ごとに自動更新</span>
+</header>
+<div class="wrap">
+  ${cards}
+</div>
+</body></html>`;
+
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-store');
+  return res.status(200).send(html);
+}
