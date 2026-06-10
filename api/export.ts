@@ -46,12 +46,14 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   const fq = (typeof req.query.q === 'string' ? req.query.q : '').trim().toLowerCase();
 
   // 対象の書類を取得（最新500件まで）
+  const fDir = typeof req.query.dir === 'string' ? req.query.dir : '';
   let q = supabase
     .from('receipts')
-    .select('id, document_type, total_amount, tax_amount, issued_date, created_at, client_id')
+    .select('id, document_type, direction, total_amount, tax_amount, issued_date, created_at, client_id')
     .order('created_at', { ascending: false })
     .limit(500);
   if (fType) q = q.eq('document_type', fType);
+  if (fDir) q = q.eq('direction', fDir);
   if (fClient) q = q.eq('client_id', fClient);
   const { data: receipts, error } = await q;
   if (error) {
@@ -118,19 +120,21 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   } else {
     // 領収書・請求書（および種別未指定の通帳以外）
     const header = [
-      '受信日時', '顧問先ID', '顧問先', '種別', '日付', '取引先', '税込金額', '消費税', '手数料',
-      '税率', '登録番号', '番号', '但し書き', '要確認', '検算メモ',
+      '受信日時', '顧問先ID', '顧問先', '売上経費', '種別', '日付', '取引先', '発行元', '宛名',
+      '税込金額', '消費税', '手数料', '税率', '登録番号', '番号', '但し書き', '要確認', '検算メモ',
     ];
+    const dirLabel = (dir: unknown) => (dir === 'sales' ? '売上' : dir === 'expense' ? '経費' : '');
     const body = filtered
       .filter((r) => r.document_type !== 'bankbook')
       .map((r) => {
         const f = fieldsByRec[r.id] ?? {};
         return [
-          jst(r.created_at), clientCode(r), clientName(r),
+          jst(r.created_at), clientCode(r), clientName(r), dirLabel(r.direction),
           DOC_LABEL[r.document_type as string] ?? r.document_type ?? '',
-          fmtDate(r.issued_date), f['vendor'] ?? '', r.total_amount ?? '', r.tax_amount ?? '',
-          f['fee'] ?? '', f['tax_rate'] ?? '', f['registration_number'] ?? '', f['receipt_no'] ?? '',
-          f['note'] ?? '', f['needs_review'] === 'true' ? '要確認' : '', f['validation_notes'] ?? '',
+          fmtDate(r.issued_date), f['counterparty'] ?? f['vendor'] ?? '', f['vendor'] ?? '', f['recipient'] ?? '',
+          r.total_amount ?? '', r.tax_amount ?? '', f['fee'] ?? '', f['tax_rate'] ?? '',
+          f['registration_number'] ?? '', f['receipt_no'] ?? '', f['note'] ?? '',
+          f['needs_review'] === 'true' ? '要確認' : '', f['validation_notes'] ?? '',
         ];
       });
     csv = toCsv([header, ...body]);

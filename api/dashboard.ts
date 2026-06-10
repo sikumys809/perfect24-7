@@ -46,7 +46,7 @@ async function loadData() {
   // 最新100件の書類
   const { data: receipts } = await supabase
     .from('receipts')
-    .select('id, document_type, total_amount, tax_amount, amount, issued_date, created_at, client_id, office_id')
+    .select('id, document_type, direction, total_amount, tax_amount, amount, issued_date, created_at, client_id, office_id')
     .order('created_at', { ascending: false })
     .limit(100);
   const recs: Row[] = receipts ?? [];
@@ -150,14 +150,15 @@ function renderCard(r: Row, d: Awaited<ReturnType<typeof loadData>>): string {
         <tbody>${rows || '<tr><td colspan="5">明細なし</td></tr>'}</tbody>
       </table>`;
   } else {
-    const vendor = fields['vendor'] ?? '取引先不明';
+    // 取引先＝顧問先から見た相手方（売上なら宛名、経費なら発行元）
+    const counterparty = fields['counterparty'] ?? fields['vendor'] ?? '取引先不明';
     const reg = fields['registration_number'];
     const taxRate = fields['tax_rate'];
     const note = fields['note'];
     const fee = fields['fee'];
     body = `
       <div class="meta">
-        <span class="vendor">${esc(vendor)}</span>
+        <span class="vendor">${esc(counterparty)}</span>
         <span class="date">${esc(fmtDate(r.issued_date))}</span>
       </div>
       <div class="amount">${yen(r.total_amount) || '金額不明'}${fee ? `<span class="fee">手数料 ${yen(fee)}</span>` : ''}</div>
@@ -175,6 +176,7 @@ function renderCard(r: Row, d: Awaited<ReturnType<typeof loadData>>): string {
     <div class="info">
       <div class="top">
         <span class="badge" style="background:${color}">${esc(label)}</span>
+        ${docType !== 'bankbook' && r.direction ? `<span class="side ${r.direction === 'sales' ? 'sales' : 'expense'}">${r.direction === 'sales' ? '売上' : '経費'}</span>` : ''}
         ${client ? `<span class="client">${esc(client.official_name)} <small>${esc(client.client_code)}</small></span>` : ''}
         ${needsReview ? `<span class="review">⚠️ 要確認</span>` : ''}
       </div>
@@ -205,17 +207,20 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   // フィルタ用パラメータ
   const showAll = req.query.all === '1';
   const fType = typeof req.query.type === 'string' ? req.query.type : '';
+  const fDir = typeof req.query.dir === 'string' ? req.query.dir : ''; // sales | expense
   const fClient = typeof req.query.client === 'string' ? req.query.client : '';
   const fq = (typeof req.query.q === 'string' ? req.query.q : '').trim();
   const key = typeof req.query.key === 'string' ? req.query.key : '';
 
   // 現在のフィルタを維持したままパラメータを差し替えるURLを作る
-  const withParams = (ov: { type?: string; client?: string; q?: string }) => {
+  const withParams = (ov: { type?: string; dir?: string; client?: string; q?: string }) => {
     const p = new URLSearchParams();
     const t = ov.type !== undefined ? ov.type : fType;
+    const dr = ov.dir !== undefined ? ov.dir : fDir;
     const c = ov.client !== undefined ? ov.client : fClient;
     const q = ov.q !== undefined ? ov.q : fq;
     if (t) p.set('type', t);
+    if (dr) p.set('dir', dr);
     if (c) p.set('client', c);
     if (q) p.set('q', q);
     if (showAll) p.set('all', '1');
@@ -233,18 +238,29 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   const meaningfulRecs = showAll ? d.recs : d.recs.filter(isMeaningful);
   const hiddenCount = showAll ? 0 : d.recs.length - meaningfulRecs.length;
 
-  // 種別・顧問先・取引先検索で絞り込み
+  // 種別・売上経費・顧問先・取引先検索で絞り込み
   let displayRecs = meaningfulRecs;
   if (fType) displayRecs = displayRecs.filter((r) => (r.document_type ?? 'other') === fType);
+  if (fDir) displayRecs = displayRecs.filter((r) => r.direction === fDir);
   if (fClient) displayRecs = displayRecs.filter((r) => r.client_id === fClient);
   if (fq) {
     const ql = fq.toLowerCase();
     displayRecs = displayRecs.filter((r) =>
-      String(d.fieldsByRec[r.id]?.['vendor'] ?? '').toLowerCase().includes(ql),
+      String(d.fieldsByRec[r.id]?.['counterparty'] ?? d.fieldsByRec[r.id]?.['vendor'] ?? '')
+        .toLowerCase()
+        .includes(ql),
     );
   }
 
   const reviewCount = displayRecs.filter((r) => d.fieldsByRec[r.id]?.['needs_review'] === 'true').length;
+
+  // 売上/経費の当月合計（表示中の集合に対して）。税込金額ベース
+  const sumByDir = (dir: string) =>
+    displayRecs
+      .filter((r) => r.direction === dir && r.document_type !== 'bankbook')
+      .reduce((s, r) => s + (Number(r.total_amount) || 0), 0);
+  const salesTotal = sumByDir('sales');
+  const expenseTotal = sumByDir('expense');
 
   // 種別タブ（件数つき）
   const typeDefs: [string, string][] = [
@@ -262,6 +278,23 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     })
     .join('');
 
+  // 売上/経費タブ
+  const dirDefs: [string, string][] = [
+    ['', 'すべて'],
+    ['sales', '売上'],
+    ['expense', '経費'],
+  ];
+  const dirTabs = dirDefs
+    .map(([val, label]) => {
+      const n =
+        val === ''
+          ? meaningfulRecs.filter((r) => r.document_type !== 'bankbook').length
+          : meaningfulRecs.filter((r) => r.direction === val).length;
+      const active = fDir === val ? ' active' : '';
+      return `<a class="tab dir ${val}${active}" href="${withParams({ dir: val })}">${esc(label)} <b>${n}</b></a>`;
+    })
+    .join('');
+
   // 顧問先ドロップダウン（書類のある顧問先のみ）
   const clients = Object.values(d.clientById).sort((a, b) =>
     String(a.client_code).localeCompare(String(b.client_code)),
@@ -276,9 +309,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   const filterBar = `
   <div class="filterbar">
     <div class="tabs">${typeTabs}</div>
+    <span class="divider"></span>
+    <div class="tabs">${dirTabs}</div>
     <form class="filters" method="get">
       ${key ? `<input type="hidden" name="key" value="${esc(key)}">` : ''}
       ${fType ? `<input type="hidden" name="type" value="${esc(fType)}">` : ''}
+      ${fDir ? `<input type="hidden" name="dir" value="${esc(fDir)}">` : ''}
       ${showAll ? `<input type="hidden" name="all" value="1">` : ''}
       <select name="client" onchange="this.form.submit()">${clientOptions}</select>
       <input name="q" value="${esc(fq)}" placeholder="取引先で検索" autocomplete="off">
@@ -290,6 +326,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
   const summary = [
     `${displayRecs.length} 件`,
+    salesTotal ? `売上 ¥${salesTotal.toLocaleString()}` : '',
+    expenseTotal ? `経費 ¥${expenseTotal.toLocaleString()}` : '',
     reviewCount ? `⚠️要確認 ${reviewCount}` : '',
     hiddenCount ? `未処理 ${hiddenCount}件は非表示` : '',
   ]
@@ -325,6 +363,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   .client { font-size:.85rem; color:var(--muted); }
   .client small { color:#94a3b8; }
   .review { color:#b45309; background:#fef3c7; font-size:.72rem; font-weight:700; padding:2px 8px; border-radius:999px; }
+  .side { font-size:.72rem; font-weight:700; padding:2px 9px; border-radius:999px; }
+  .side.sales { color:#047857; background:#d1fae5; }
+  .side.expense { color:#1e40af; background:#dbeafe; }
   .meta { display:flex; align-items:baseline; gap:10px; flex-wrap:wrap; }
   .vendor { font-size:1.05rem; font-weight:700; }
   .date { color:var(--muted); font-size:.85rem; }
@@ -347,6 +388,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   .tab b { color:#94a3b8; font-weight:700; }
   .tab.active { background:#0f172a; color:#fff; border-color:#0f172a; }
   .tab.active b { color:#cbd5e1; }
+  .tab.dir.sales.active { background:#047857; border-color:#047857; }
+  .tab.dir.expense.active { background:#1e40af; border-color:#1e40af; }
+  .divider { width:1px; height:20px; background:var(--line); }
   .filters { display:flex; gap:6px; align-items:center; }
   .filters select, .filters input { font-size:.85rem; padding:6px 9px; border:1px solid var(--line); border-radius:8px; background:#fff; }
   .filters button { font-size:.85rem; padding:6px 12px; border:none; border-radius:8px; background:#2563eb; color:#fff; cursor:pointer; }
