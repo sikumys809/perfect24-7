@@ -121,7 +121,12 @@ Generated on 2026-06-10
 - **棚卸表**（inventory）/ **借入金返済予定表**（loan_schedule）: 列構成が独自なので **document_lines テーブル新設（migration 009・適用済）**。inventory=品名/数量/単価/金額・total=期末在庫金額、loan=返済日/元金/利息/残高。direction=null。
 - **給与明細(payslip)/賃金台帳(wage_ledger)**: 人件費の仕訳直結。専用テーブル **payroll_lines（migration 010・適用済）** に従業員行（総支給/健保/厚年/雇用/源泉/住民税/その他控除/控除合計/差引）。給与明細=1行、賃金台帳=複数行。direction=経費、total=総支給合計。検算: 総支給-控除合計=差引／控除内訳合計=控除合計。
 - 数表の手書き誤読対策: 返済予定表(返済額=元金+利息／前残高-元金=当残高)・棚卸(数量×単価=金額)・給与(上記)の検算で不整合行を要確認。プロンプトも手書きは推測で埋めず confidence を下げる方針を明記。
-- 全種別: ダッシュボードに種別タブ＋専用テーブル表示、CSVは種別ごとに明細/書類レベルで出力。document_type 一覧: receipt/invoice/bankbook/credit_card/tax_payment/balance_certificate/inventory/loan_schedule/payslip/wage_ledger/other。明細系の表示判定(isMeaningful)は明細行(bank_transactions/document_lines/payroll_lines)の有無も見る（dashboard/export両方）。
+- **固定資産(fixed_asset)/EC入金(ec_payout)/小口現金出納帳(petty_cash)**: いずれもマイグレーション不要（既存パターン再利用）。
+  - petty_cash = 通帳と同じ bank_transactions（saveBankTransactions を docType 引数化して再利用）。残高検算あり。
+  - fixed_asset = 領収書型再利用。資産名/区分/耐用年数/取得価額、direction=null（資産計上で経費でない）。返信【資産】。
+  - ec_payout = 領収書型再利用。総売上=total/手数料=fee/入金額=net_amount、direction=売上、vendor=プラットフォーム名。
+  - ⚠️実機未検証（コミット bd9cd8f でpush・本番反映済だが、実際の固定資産/EC/小口現金の書類でまだテストしていない）。
+- 全種別: ダッシュボードに種別タブ＋専用テーブル表示、CSVは種別ごとに明細/書類レベルで出力。document_type 一覧: receipt/invoice/bankbook/credit_card/tax_payment/balance_certificate/inventory/loan_schedule/payslip/wage_ledger/fixed_asset/ec_payout/petty_cash/other。明細系の表示判定(isMeaningful)は明細行(bank_transactions/document_lines/payroll_lines)の有無も見る（dashboard/export両方）。
 - 設計指針（ユーザー方針）: サービスの核は「顧問先は楽・事務所はLINEのデータを管理画面→会計ソフトにアップロード」。余計なものは足さず、痒いところ（=決算書類の網羅・種別フィルタ）は完璧に。
 
 ## 次の候補（未着手・優先順は要相談）
