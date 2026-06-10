@@ -126,9 +126,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   let csv: string;
   let fname: string;
 
-  if (fType === 'bankbook') {
-    // 通帳は明細1行=1レコードで出力
-    const header = ['受信日時', '顧問先ID', '顧問先', '通帳ID', '行', '取引日', '摘要', '出金', '入金', '残高', '要確認'];
+  if (fType === 'bankbook' || fType === 'petty_cash') {
+    // 通帳・小口現金は明細1行=1レコードで出力
+    const header = ['受信日時', '顧問先ID', '顧問先', '帳簿ID', '行', '取引日', '摘要', '出金/支払', '入金/受入', '残高', '要確認'];
     const body: (string | number | null)[][] = [];
     for (const r of filtered) {
       const review = fieldsByRec[r.id]?.['needs_review'] === 'true' ? '要確認' : '';
@@ -141,7 +141,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       }
     }
     csv = toCsv([header, ...body]);
-    fname = 'bankbook';
+    fname = fType;
   } else if (fType === 'credit_card') {
     // カード明細は利用1行=1レコードで出力
     const header = ['受信日時', '顧問先ID', '顧問先', 'カード', '明細ID', '行', '利用日', '利用先', '金額', '要確認'];
@@ -210,13 +210,14 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     // 領収書・請求書（および種別未指定の通帳以外）
     const header = [
       '受信日時', '顧問先ID', '顧問先', '売上経費', '種別', '日付', '取引先', '発行元', '宛名',
-      '税込金額', '消費税', '手数料', '税率', '税目', '対象期間', '登録番号', '番号', '但し書き', '要確認', '検算メモ',
+      '税込金額', '消費税', '手数料', '入金額', '税率', '税目', '対象期間', '資産名', '資産区分', '耐用年数',
+      '登録番号', '番号', '但し書き', '要確認', '検算メモ',
     ];
     const dirLabel = (dir: unknown) => (dir === 'sales' ? '売上' : dir === 'expense' ? '経費' : '');
     const body = filtered
       .filter(
         (r) =>
-          !['bankbook', 'credit_card', 'inventory', 'loan_schedule', 'payslip', 'wage_ledger'].includes(
+          !['bankbook', 'petty_cash', 'credit_card', 'inventory', 'loan_schedule', 'payslip', 'wage_ledger'].includes(
             r.document_type as string,
           ),
       )
@@ -226,8 +227,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           jst(r.created_at), clientCode(r), clientName(r), dirLabel(r.direction),
           DOC_LABEL[r.document_type as string] ?? r.document_type ?? '',
           fmtDate(r.issued_date), f['counterparty'] ?? f['vendor'] ?? '', f['vendor'] ?? '', f['recipient'] ?? '',
-          r.total_amount ?? '', r.tax_amount ?? '', f['fee'] ?? '', f['tax_rate'] ?? '',
-          f['tax_kind'] ?? '', f['period'] ?? '',
+          r.total_amount ?? '', r.tax_amount ?? '', f['fee'] ?? '', f['net_amount'] ?? '', f['tax_rate'] ?? '',
+          f['tax_kind'] ?? '', f['period'] ?? '', f['asset_name'] ?? '', f['asset_category'] ?? '', f['useful_life'] ?? '',
           f['registration_number'] ?? '', f['receipt_no'] ?? '', f['note'] ?? '',
           f['needs_review'] === 'true' ? '要確認' : '', f['validation_notes'] ?? '',
         ];

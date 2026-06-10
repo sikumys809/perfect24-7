@@ -23,6 +23,9 @@ const DOC_LABEL: Record<string, string> = {
   loan_schedule: '返済予定表',
   payslip: '給与明細',
   wage_ledger: '賃金台帳',
+  fixed_asset: '固定資産',
+  ec_payout: 'EC入金',
+  petty_cash: '小口現金',
   other: 'その他',
 };
 const DOC_COLOR: Record<string, string> = {
@@ -36,6 +39,9 @@ const DOC_COLOR: Record<string, string> = {
   loan_schedule: '#9333ea',
   payslip: '#c026d3',
   wage_ledger: '#a21caf',
+  fixed_asset: '#0369a1',
+  ec_payout: '#16a34a',
+  petty_cash: '#0d9488',
   other: '#6b7280',
 };
 
@@ -167,8 +173,9 @@ function renderCard(r: Row, d: Awaited<ReturnType<typeof loadData>>): string {
 
   // 本文
   let body: string;
-  if (docType === 'bankbook') {
+  if (docType === 'bankbook' || docType === 'petty_cash') {
     const txns = d.txnByRec[r.id] ?? [];
+    const label = docType === 'petty_cash' ? '小口現金 出納' : '通帳 明細';
     const rows = txns
       .map(
         (t) => `<tr${(t.confidence != null && Number(t.confidence) < 0.7) ? ' class="low"' : ''}>
@@ -180,9 +187,9 @@ function renderCard(r: Row, d: Awaited<ReturnType<typeof loadData>>): string {
       )
       .join('');
     body = `
-      <div class="meta"><span class="vendor">通帳 明細 ${txns.length} 件</span></div>
+      <div class="meta"><span class="vendor">${label} ${txns.length} 件</span></div>
       <table class="txns">
-        <thead><tr><th>日付</th><th>摘要</th><th>出金</th><th>入金</th><th>残高</th></tr></thead>
+        <thead><tr><th>日付</th><th>摘要</th><th>${docType === 'petty_cash' ? '支払' : '出金'}</th><th>${docType === 'petty_cash' ? '受入' : '入金'}</th><th>残高</th></tr></thead>
         <tbody>${rows || '<tr><td colspan="5">明細なし</td></tr>'}</tbody>
       </table>`;
   } else if (docType === 'credit_card') {
@@ -284,14 +291,22 @@ function renderCard(r: Row, d: Awaited<ReturnType<typeof loadData>>): string {
     const fee = fields['fee'];
     const taxKind = fields['tax_kind'];
     const period = fields['period'];
+    const assetName = fields['asset_name'];
+    const assetCat = fields['asset_category'];
+    const usefulLife = fields['useful_life'];
+    const netAmount = fields['net_amount'];
+    const headName = docType === 'fixed_asset' && assetName ? assetName : counterparty;
     body = `
       <div class="meta">
-        <span class="vendor">${esc(counterparty)}</span>
+        <span class="vendor">${esc(headName)}</span>
         <span class="date">${esc(fmtDate(r.issued_date))}</span>
       </div>
-      <div class="amount">${yen(r.total_amount) || '金額不明'}${fee ? `<span class="fee">手数料 ${yen(fee)}</span>` : ''}</div>
+      <div class="amount">${yen(r.total_amount) || '金額不明'}${fee ? `<span class="fee">手数料 ${yen(fee)}</span>` : ''}${netAmount ? `<span class="fee">入金 ${yen(netAmount)}</span>` : ''}</div>
       <div class="sub">
         ${taxKind ? `<span class="taxkind">${esc(taxKind)}</span>` : ''}
+        ${assetCat ? `<span class="taxkind">${esc(assetCat)}</span>` : ''}
+        ${usefulLife ? `<span>耐用年数 ${esc(usefulLife)}年</span>` : ''}
+        ${docType === 'fixed_asset' && counterparty ? `<span>購入先 ${esc(counterparty)}</span>` : ''}
         ${period ? `<span>${esc(period)}</span>` : ''}
         ${r.tax_amount != null ? `<span>税 ${yen(r.tax_amount)}</span>` : ''}
         ${taxRate ? `<span>${esc(taxRate)}</span>` : ''}
@@ -401,6 +416,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     ['tax_payment', '納付書'],
     ['credit_card', 'カード明細'],
     ['bankbook', '通帳'],
+    ['petty_cash', '小口現金'],
+    ['ec_payout', 'EC入金'],
+    ['fixed_asset', '固定資産'],
     ['payslip', '給与明細'],
     ['wage_ledger', '賃金台帳'],
     ['inventory', '棚卸表'],
