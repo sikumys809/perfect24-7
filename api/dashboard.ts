@@ -320,11 +320,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   };
 
   // 解析できた書類だけを表示（?all=1 で未処理・空カードも含め全件表示）。
-  // 判定: 通帳 / 金額あり / 取引先ありのいずれか＝意味のある抽出ができている
+  // 判定: 金額あり / 取引先あり / 明細行あり（通帳・カード・棚卸・返済表）のいずれか＝抽出できている
   const isMeaningful = (r: Row) =>
-    r.document_type === 'bankbook' ||
     r.total_amount != null ||
-    Boolean(d.fieldsByRec[r.id]?.['vendor']);
+    Boolean(d.fieldsByRec[r.id]?.['vendor']) ||
+    (d.txnByRec[r.id]?.length ?? 0) > 0 ||
+    (d.lineByRec[r.id]?.length ?? 0) > 0;
   const meaningfulRecs = showAll ? d.recs : d.recs.filter(isMeaningful);
   const hiddenCount = showAll ? 0 : d.recs.length - meaningfulRecs.length;
 
