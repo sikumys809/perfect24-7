@@ -16,12 +16,14 @@ const DOC_LABEL: Record<string, string> = {
   receipt: '領収書',
   invoice: '請求書',
   bankbook: '通帳',
+  credit_card: 'カード明細',
   other: 'その他',
 };
 const DOC_COLOR: Record<string, string> = {
   receipt: '#2563eb',
   invoice: '#7c3aed',
   bankbook: '#0d9488',
+  credit_card: '#db2777',
   other: '#6b7280',
 };
 
@@ -149,6 +151,27 @@ function renderCard(r: Row, d: Awaited<ReturnType<typeof loadData>>): string {
         <thead><tr><th>日付</th><th>摘要</th><th>出金</th><th>入金</th><th>残高</th></tr></thead>
         <tbody>${rows || '<tr><td colspan="5">明細なし</td></tr>'}</tbody>
       </table>`;
+  } else if (docType === 'credit_card') {
+    const txns = d.txnByRec[r.id] ?? [];
+    const cardName = fields['vendor'];
+    const total = txns.reduce((s, t) => s + (Number(t.withdrawal) || 0), 0);
+    const rows = txns
+      .map(
+        (t) => `<tr${(t.confidence != null && Number(t.confidence) < 0.7) ? ' class="low"' : ''}>
+        <td>${esc(fmtDate(t.txn_date))}</td>
+        <td class="desc">${esc(t.description ?? '')}</td>
+        <td class="num">${yen(t.withdrawal)}</td></tr>`,
+      )
+      .join('');
+    body = `
+      <div class="meta">
+        <span class="vendor">${esc(cardName ?? 'カード明細')}</span>
+        <span class="date">利用 ${txns.length} 件・合計 ${yen(total)}</span>
+      </div>
+      <table class="txns">
+        <thead><tr><th>利用日</th><th>利用先</th><th>金額</th></tr></thead>
+        <tbody>${rows || '<tr><td colspan="3">明細なし</td></tr>'}</tbody>
+      </table>`;
   } else {
     // 取引先＝顧問先から見た相手方（売上なら宛名、経費なら発行元）
     const counterparty = fields['counterparty'] ?? fields['vendor'] ?? '取引先不明';
@@ -267,6 +290,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     ['', 'すべて'],
     ['receipt', '領収書'],
     ['invoice', '請求書'],
+    ['credit_card', 'カード'],
     ['bankbook', '通帳'],
   ];
   const typeTabs = typeDefs

@@ -117,6 +117,22 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
     csv = toCsv([header, ...body]);
     fname = 'bankbook';
+  } else if (fType === 'credit_card') {
+    // カード明細は利用1行=1レコードで出力
+    const header = ['受信日時', '顧問先ID', '顧問先', 'カード', '明細ID', '行', '利用日', '利用先', '金額', '要確認'];
+    const body: (string | number | null)[][] = [];
+    for (const r of filtered) {
+      const review = fieldsByRec[r.id]?.['needs_review'] === 'true' ? '要確認' : '';
+      const card = fieldsByRec[r.id]?.['vendor'] ?? '';
+      for (const t of txnByRec[r.id] ?? []) {
+        body.push([
+          jst(r.created_at), clientCode(r), clientName(r), card, String(r.id).slice(0, 8),
+          t.line_no, fmtDate(t.txn_date), t.description ?? '', t.withdrawal ?? '', review,
+        ]);
+      }
+    }
+    csv = toCsv([header, ...body]);
+    fname = 'credit_card';
   } else {
     // 領収書・請求書（および種別未指定の通帳以外）
     const header = [
