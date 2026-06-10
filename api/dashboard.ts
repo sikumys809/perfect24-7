@@ -399,12 +399,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     ['receipt', '領収書'],
     ['invoice', '請求書'],
     ['tax_payment', '納付書'],
-    ['credit_card', 'カード'],
+    ['credit_card', 'カード明細'],
     ['bankbook', '通帳'],
-    ['payslip', '給与'],
+    ['payslip', '給与明細'],
     ['wage_ledger', '賃金台帳'],
-    ['inventory', '棚卸'],
-    ['loan_schedule', '返済表'],
+    ['inventory', '棚卸表'],
+    ['loan_schedule', '返済予定表'],
     ['balance_certificate', '残高証明'],
   ];
   const typeTabs = typeDefs
