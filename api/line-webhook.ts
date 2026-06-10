@@ -493,6 +493,27 @@ async function findClientByLineUser(lineUserId: string, officeId: string | null)
   return data && data.length > 0 ? data[0] : null;
 }
 
+// 顧問先が送り続けたくなる即時フィードバック用に、当月の登録件数・累計金額を返す。
+// （回収率＝堀。送ると「今月N件目・累計¥X」が即返る）。失敗しても本処理は止めない。
+async function monthlyTallyLine(clientId: string | null | undefined): Promise<string> {
+  if (!clientId) return '';
+  try {
+    // JST での当月初日（00:00 JST）
+    const jst = new Date(Date.now() + 9 * 3600 * 1000);
+    const monthStart = `${jst.getUTCFullYear()}-${String(jst.getUTCMonth() + 1).padStart(2, '0')}-01T00:00:00+09:00`;
+    const { data, count } = await supabase
+      .from('receipts')
+      .select('total_amount', { count: 'exact' })
+      .eq('client_id', clientId)
+      .gte('created_at', monthStart);
+    const n = count ?? data?.length ?? 0;
+    const total = (data ?? []).reduce((s, r) => s + (Number(r.total_amount) || 0), 0);
+    return `\n📥 今月 ${n} 件目・累計 ¥${total.toLocaleString()}`;
+  } catch {
+    return '';
+  }
+}
+
 // テキスト（=登録コード想定）を処理して顧問先をひもづける
 async function handleRegistration(ev: any, lineUserId: string | null, ctx: ReqCtx) {
   if (!lineUserId) return;
@@ -681,10 +702,11 @@ async function processWebhookEvents(bodyText: string, ctx: ReqCtx) {
           const warn = validation.badLines.length
             ? `\n⚠️ ${validation.badLines.join(', ')}行目の残高が合いません（金額の誤読の可能性。要確認）`
             : '';
+          const tally = await monthlyTallyLine(client.id);
           await replyLineMessage(
             ctx.accessToken,
             ev.replyToken,
-            `通帳を登録しました（明細${count}件）${warn}`,
+            `通帳を登録しました（明細${count}件）${warn}${tally}`,
           );
         }
         continue;
@@ -721,7 +743,8 @@ async function processWebhookEvents(bodyText: string, ctx: ReqCtx) {
       if (ev.replyToken) {
         const head =
           receipts.length > 1 ? `登録しました（${receipts.length}件）\n` : '登録しました。\n';
-        await replyLineMessage(ctx.accessToken, ev.replyToken, head + summaries.join('\n'));
+        const tally = await monthlyTallyLine(client.id);
+        await replyLineMessage(ctx.accessToken, ev.replyToken, head + summaries.join('\n') + tally);
       }
     } catch (err) {
       console.error('Event processing error:', err);
