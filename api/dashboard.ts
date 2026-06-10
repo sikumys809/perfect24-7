@@ -202,25 +202,34 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return res.status(500).send('<!doctype html><meta charset="utf-8"><body style="font-family:sans-serif;padding:2rem">データ取得でエラーが発生しました。</body>');
   }
 
-  const counts = d.recs.reduce<Record<string, number>>((m, r) => {
+  // 解析できた書類だけを表示（?all=1 で未処理・空カードも含め全件表示）。
+  // 判定: 通帳 / 金額あり / 取引先ありのいずれか＝意味のある抽出ができている
+  const showAll = req.query.all === '1';
+  const isMeaningful = (r: Row) =>
+    r.document_type === 'bankbook' ||
+    r.total_amount != null ||
+    Boolean(d.fieldsByRec[r.id]?.['vendor']);
+  const displayRecs = showAll ? d.recs : d.recs.filter(isMeaningful);
+  const hiddenCount = d.recs.length - displayRecs.length;
+
+  const counts = displayRecs.reduce<Record<string, number>>((m, r) => {
     const k = r.document_type ?? 'other';
     m[k] = (m[k] ?? 0) + 1;
     return m;
   }, {});
-  const reviewCount = d.recs.filter((r) => d.fieldsByRec[r.id]?.['needs_review'] === 'true').length;
+  const reviewCount = displayRecs.filter((r) => d.fieldsByRec[r.id]?.['needs_review'] === 'true').length;
   const summary = [
-    `${d.recs.length} 件`,
+    `${displayRecs.length} 件`,
     ...Object.entries(counts).map(([k, n]) => `${DOC_LABEL[k] ?? k} ${n}`),
     reviewCount ? `⚠️要確認 ${reviewCount}` : '',
+    !showAll && hiddenCount ? `未処理 ${hiddenCount}件は非表示` : '',
   ]
     .filter(Boolean)
     .join(' ・ ');
 
-  const cards = d.recs.length
-    ? d.recs.map((r) => renderCard(r, d)).join('\n')
+  const cards = displayRecs.length
+    ? displayRecs.map((r) => renderCard(r, d)).join('\n')
     : '<div class="empty">まだ書類が届いていません。LINE で領収書・請求書・通帳を送ってください。</div>';
-
-  const keyParam = keyEnforced ? `?key=${encodeURIComponent(String(req.query.key))}` : '';
 
   const html = `<!doctype html>
 <html lang="ja"><head>
