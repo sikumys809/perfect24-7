@@ -21,6 +21,8 @@ const DOC_LABEL: Record<string, string> = {
   balance_certificate: '残高証明',
   inventory: '棚卸表',
   loan_schedule: '返済予定表',
+  payslip: '給与明細',
+  wage_ledger: '賃金台帳',
   other: 'その他',
 };
 const DOC_COLOR: Record<string, string> = {
@@ -32,6 +34,8 @@ const DOC_COLOR: Record<string, string> = {
   balance_certificate: '#0891b2',
   inventory: '#65a30d',
   loan_schedule: '#9333ea',
+  payslip: '#c026d3',
+  wage_ledger: '#a21caf',
   other: '#6b7280',
 };
 
@@ -60,13 +64,13 @@ async function loadData() {
     .order('created_at', { ascending: false })
     .limit(100);
   const recs: Row[] = receipts ?? [];
-  if (recs.length === 0) return { recs, fieldsByRec: {}, imgByRec: {}, txnByRec: {}, lineByRec: {}, clientById: {}, officeById: {}, signed: {} };
+  if (recs.length === 0) return { recs, fieldsByRec: {}, imgByRec: {}, txnByRec: {}, lineByRec: {}, payByRec: {}, clientById: {}, officeById: {}, signed: {} };
 
   const ids = recs.map((r) => r.id);
   const clientIds = [...new Set(recs.map((r) => r.client_id).filter(Boolean))];
   const officeIds = [...new Set(recs.map((r) => r.office_id).filter(Boolean))];
 
-  const [fieldsRes, imgRes, txnRes, lineRes, clientRes, officeRes] = await Promise.all([
+  const [fieldsRes, imgRes, txnRes, lineRes, payRes, clientRes, officeRes] = await Promise.all([
     supabase.from('extracted_fields').select('receipt_id, field_name, field_value').in('receipt_id', ids),
     supabase.from('receipt_images').select('receipt_id, storage_path, content_type').in('receipt_id', ids),
     supabase
@@ -78,6 +82,13 @@ async function loadData() {
     supabase
       .from('document_lines')
       .select('receipt_id, line_no, line_type, label, line_date, quantity, unit_price, amount, principal, interest, balance, confidence')
+      .in('receipt_id', ids)
+      .order('line_no', { ascending: true })
+      .then((r) => r, () => ({ data: [] as Row[] })),
+    // payroll_lines（給与明細・賃金台帳）。テーブル未作成でも落ちないよう握りつぶす
+    supabase
+      .from('payroll_lines')
+      .select('receipt_id, line_no, employee, pay_month, gross, health_insurance, pension, employment_insurance, income_tax, resident_tax, other_deduction, total_deduction, net, confidence')
       .in('receipt_id', ids)
       .order('line_no', { ascending: true })
       .then((r) => r, () => ({ data: [] as Row[] })),
@@ -106,6 +117,10 @@ async function loadData() {
   for (const l of lineRes.data ?? []) {
     (lineByRec[l.receipt_id] ??= []).push(l);
   }
+  const payByRec: Record<string, Row[]> = {};
+  for (const p of payRes.data ?? []) {
+    (payByRec[p.receipt_id] ??= []).push(p);
+  }
   const clientById: Record<string, Row> = {};
   for (const c of clientRes.data ?? []) clientById[c.id] = c;
   const officeById: Record<string, Row> = {};
@@ -123,7 +138,7 @@ async function loadData() {
     }
   }
 
-  return { recs, fieldsByRec, imgByRec, txnByRec, lineByRec, clientById, officeById, signed };
+  return { recs, fieldsByRec, imgByRec, txnByRec, lineByRec, payByRec, clientById, officeById, signed };
 }
 
 function renderCard(r: Row, d: Awaited<ReturnType<typeof loadData>>): string {
@@ -234,6 +249,31 @@ function renderCard(r: Row, d: Awaited<ReturnType<typeof loadData>>): string {
       <table class="txns">
         <thead><tr><th>回</th><th>返済日</th><th>返済額</th><th>元金</th><th>利息</th><th>残高</th></tr></thead>
         <tbody>${rows || '<tr><td colspan="6">明細なし</td></tr>'}</tbody>
+      </table>`;
+  } else if (docType === 'payslip' || docType === 'wage_ledger') {
+    const lines = d.payByRec[r.id] ?? [];
+    const total = lines.reduce((s, l) => s + (Number(l.gross) || 0), 0);
+    const label = docType === 'wage_ledger' ? '賃金台帳' : '給与明細';
+    const rows = lines
+      .map(
+        (l) => `<tr${(l.confidence != null && Number(l.confidence) < 0.7) ? ' class="low"' : ''}>
+        <td class="desc">${esc(l.employee ?? '')}</td>
+        <td>${esc(l.pay_month ?? '')}</td>
+        <td class="num">${yen(l.gross)}</td>
+        <td class="num">${yen((Number(l.health_insurance) || 0) + (Number(l.pension) || 0) + (Number(l.employment_insurance) || 0))}</td>
+        <td class="num">${yen(l.income_tax)}</td>
+        <td class="num">${yen(l.resident_tax)}</td>
+        <td class="num">${yen(l.net)}</td></tr>`,
+      )
+      .join('');
+    body = `
+      <div class="meta">
+        <span class="vendor">${esc(label)}</span>
+        <span class="date">${lines.length}名分・総支給計 ${yen(total)}</span>
+      </div>
+      <table class="txns">
+        <thead><tr><th>従業員</th><th>支給月</th><th>総支給</th><th>社保</th><th>源泉</th><th>住民税</th><th>差引</th></tr></thead>
+        <tbody>${rows || '<tr><td colspan="7">明細なし</td></tr>'}</tbody>
       </table>`;
   } else {
     // 取引先＝顧問先から見た相手方（売上なら宛名、経費なら発行元）
@@ -361,6 +401,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     ['tax_payment', '納付書'],
     ['credit_card', 'カード'],
     ['bankbook', '通帳'],
+    ['payslip', '給与'],
+    ['wage_ledger', '賃金台帳'],
     ['inventory', '棚卸'],
     ['loan_schedule', '返済表'],
     ['balance_certificate', '残高証明'],
