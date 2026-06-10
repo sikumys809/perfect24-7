@@ -119,7 +119,9 @@ Generated on 2026-06-10
 - **税金・社保の納付書/領収証書**（tax_payment）: 領収書型を再利用（移行不要）。tax_kind(税目)/period(対象期間)、経費。返信【納付】税目。
 - **残高証明書**（balance_certificate）: 領収書型を再利用（移行不要）。口座ごと1件、direction=null（B/S項目）。返信【残高】。
 - **棚卸表**（inventory）/ **借入金返済予定表**（loan_schedule）: 列構成が独自なので **document_lines テーブル新設（migration 009・適用済）**。inventory=品名/数量/単価/金額・total=期末在庫金額、loan=返済日/元金/利息/残高。direction=null。
-- 全種別: ダッシュボードに種別タブ＋専用テーブル表示、CSVは種別ごとに明細/書類レベルで出力。document_type 一覧: receipt/invoice/bankbook/credit_card/tax_payment/balance_certificate/inventory/loan_schedule/other。
+- **給与明細(payslip)/賃金台帳(wage_ledger)**: 人件費の仕訳直結。専用テーブル **payroll_lines（migration 010・適用済）** に従業員行（総支給/健保/厚年/雇用/源泉/住民税/その他控除/控除合計/差引）。給与明細=1行、賃金台帳=複数行。direction=経費、total=総支給合計。検算: 総支給-控除合計=差引／控除内訳合計=控除合計。
+- 数表の手書き誤読対策: 返済予定表(返済額=元金+利息／前残高-元金=当残高)・棚卸(数量×単価=金額)・給与(上記)の検算で不整合行を要確認。プロンプトも手書きは推測で埋めず confidence を下げる方針を明記。
+- 全種別: ダッシュボードに種別タブ＋専用テーブル表示、CSVは種別ごとに明細/書類レベルで出力。document_type 一覧: receipt/invoice/bankbook/credit_card/tax_payment/balance_certificate/inventory/loan_schedule/payslip/wage_ledger/other。明細系の表示判定(isMeaningful)は明細行(bank_transactions/document_lines/payroll_lines)の有無も見る（dashboard/export両方）。
 - 設計指針（ユーザー方針）: サービスの核は「顧問先は楽・事務所はLINEのデータを管理画面→会計ソフトにアップロード」。余計なものは足さず、痒いところ（=決算書類の網羅・種別フィルタ）は完璧に。
 
 ## 次の候補（未着手・優先順は要相談）
