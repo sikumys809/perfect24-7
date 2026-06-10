@@ -100,9 +100,13 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   const clientName = (r: Row) => (r.client_id ? clientById[r.client_id]?.official_name ?? '' : '');
   const clientCode = (r: Row) => (r.client_id ? clientById[r.client_id]?.client_code ?? '' : '');
 
-  // 解析できた書類のみ（未処理は除外）。取引先検索 q も適用
+  // 解析できた書類のみ（未処理は除外）。金額/取引先/明細行のいずれかがあれば対象。取引先検索 q も適用
   const meaningful = recs.filter(
-    (r) => r.document_type === 'bankbook' || r.total_amount != null || Boolean(fieldsByRec[r.id]?.['vendor']),
+    (r) =>
+      r.total_amount != null ||
+      Boolean(fieldsByRec[r.id]?.['vendor']) ||
+      (txnByRec[r.id]?.length ?? 0) > 0 ||
+      (lineByRec[r.id]?.length ?? 0) > 0,
   );
   const filtered = fq
     ? meaningful.filter((r) => String(fieldsByRec[r.id]?.['vendor'] ?? '').toLowerCase().includes(fq))
