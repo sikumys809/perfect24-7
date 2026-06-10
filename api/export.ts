@@ -64,7 +64,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   const ids = recs.map((r) => r.id);
   const clientIds = [...new Set(recs.map((r) => r.client_id).filter(Boolean))];
 
-  const [fieldsRes, txnRes, clientRes] = await Promise.all([
+  const [fieldsRes, txnRes, lineRes, clientRes] = await Promise.all([
     ids.length
       ? supabase.from('extracted_fields').select('receipt_id, field_name, field_value').in('receipt_id', ids)
       : Promise.resolve({ data: [] as Row[] }),
@@ -75,6 +75,14 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           .in('receipt_id', ids)
           .order('line_no', { ascending: true })
       : Promise.resolve({ data: [] as Row[] }),
+    ids.length
+      ? supabase
+          .from('document_lines')
+          .select('receipt_id, line_no, line_type, label, line_date, quantity, unit_price, amount, principal, interest, balance')
+          .in('receipt_id', ids)
+          .order('line_no', { ascending: true })
+          .then((r) => r, () => ({ data: [] as Row[] }))
+      : Promise.resolve({ data: [] as Row[] }),
     clientIds.length
       ? supabase.from('clients').select('id, client_code, official_name').in('id', clientIds)
       : Promise.resolve({ data: [] as Row[] }),
@@ -84,6 +92,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   for (const f of fieldsRes.data ?? []) (fieldsByRec[f.receipt_id] ??= {})[f.field_name] = f.field_value;
   const txnByRec: Record<string, Row[]> = {};
   for (const t of txnRes.data ?? []) (txnByRec[t.receipt_id] ??= []).push(t);
+  const lineByRec: Record<string, Row[]> = {};
+  for (const l of lineRes.data ?? []) (lineByRec[l.receipt_id] ??= []).push(l);
   const clientById: Record<string, Row> = {};
   for (const c of clientRes.data ?? []) clientById[c.id] = c;
 
@@ -133,6 +143,37 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
     csv = toCsv([header, ...body]);
     fname = 'credit_card';
+  } else if (fType === 'inventory') {
+    // 棚卸表は品目1行=1レコードで出力
+    const header = ['受信日時', '顧問先ID', '顧問先', '棚卸ID', '行', '品名', '数量', '単価', '金額', '要確認'];
+    const body: (string | number | null)[][] = [];
+    for (const r of filtered) {
+      const review = fieldsByRec[r.id]?.['needs_review'] === 'true' ? '要確認' : '';
+      for (const l of lineByRec[r.id] ?? []) {
+        body.push([
+          jst(r.created_at), clientCode(r), clientName(r), String(r.id).slice(0, 8),
+          l.line_no, l.label ?? '', l.quantity ?? '', l.unit_price ?? '', l.amount ?? '', review,
+        ]);
+      }
+    }
+    csv = toCsv([header, ...body]);
+    fname = 'inventory';
+  } else if (fType === 'loan_schedule') {
+    // 借入金返済予定表は返済1回=1レコードで出力
+    const header = ['受信日時', '顧問先ID', '顧問先', '借入先', '返済表ID', '回', '返済日', '返済額', '元金', '利息', '残高', '要確認'];
+    const body: (string | number | null)[][] = [];
+    for (const r of filtered) {
+      const review = fieldsByRec[r.id]?.['needs_review'] === 'true' ? '要確認' : '';
+      const lender = fieldsByRec[r.id]?.['vendor'] ?? '';
+      for (const l of lineByRec[r.id] ?? []) {
+        body.push([
+          jst(r.created_at), clientCode(r), clientName(r), lender, String(r.id).slice(0, 8),
+          l.label ?? '', fmtDate(l.line_date), l.amount ?? '', l.principal ?? '', l.interest ?? '', l.balance ?? '', review,
+        ]);
+      }
+    }
+    csv = toCsv([header, ...body]);
+    fname = 'loan_schedule';
   } else {
     // 領収書・請求書（および種別未指定の通帳以外）
     const header = [
@@ -141,7 +182,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     ];
     const dirLabel = (dir: unknown) => (dir === 'sales' ? '売上' : dir === 'expense' ? '経費' : '');
     const body = filtered
-      .filter((r) => r.document_type !== 'bankbook' && r.document_type !== 'credit_card')
+      .filter(
+        (r) =>
+          !['bankbook', 'credit_card', 'inventory', 'loan_schedule'].includes(r.document_type as string),
+      )
       .map((r) => {
         const f = fieldsByRec[r.id] ?? {};
         return [

@@ -19,6 +19,8 @@ const DOC_LABEL: Record<string, string> = {
   credit_card: 'カード明細',
   tax_payment: '納付書',
   balance_certificate: '残高証明',
+  inventory: '棚卸表',
+  loan_schedule: '返済予定表',
   other: 'その他',
 };
 const DOC_COLOR: Record<string, string> = {
@@ -28,6 +30,8 @@ const DOC_COLOR: Record<string, string> = {
   credit_card: '#db2777',
   tax_payment: '#ea580c',
   balance_certificate: '#0891b2',
+  inventory: '#65a30d',
+  loan_schedule: '#9333ea',
   other: '#6b7280',
 };
 
@@ -56,13 +60,13 @@ async function loadData() {
     .order('created_at', { ascending: false })
     .limit(100);
   const recs: Row[] = receipts ?? [];
-  if (recs.length === 0) return { recs, fieldsByRec: {}, imgByRec: {}, txnByRec: {}, clientById: {}, officeById: {}, signed: {} };
+  if (recs.length === 0) return { recs, fieldsByRec: {}, imgByRec: {}, txnByRec: {}, lineByRec: {}, clientById: {}, officeById: {}, signed: {} };
 
   const ids = recs.map((r) => r.id);
   const clientIds = [...new Set(recs.map((r) => r.client_id).filter(Boolean))];
   const officeIds = [...new Set(recs.map((r) => r.office_id).filter(Boolean))];
 
-  const [fieldsRes, imgRes, txnRes, clientRes, officeRes] = await Promise.all([
+  const [fieldsRes, imgRes, txnRes, lineRes, clientRes, officeRes] = await Promise.all([
     supabase.from('extracted_fields').select('receipt_id, field_name, field_value').in('receipt_id', ids),
     supabase.from('receipt_images').select('receipt_id, storage_path, content_type').in('receipt_id', ids),
     supabase
@@ -70,6 +74,13 @@ async function loadData() {
       .select('receipt_id, line_no, txn_date, description, withdrawal, deposit, balance, confidence')
       .in('receipt_id', ids)
       .order('line_no', { ascending: true }),
+    // document_lines（棚卸・返済予定表）。テーブル未作成でも落ちないよう握りつぶす
+    supabase
+      .from('document_lines')
+      .select('receipt_id, line_no, line_type, label, line_date, quantity, unit_price, amount, principal, interest, balance, confidence')
+      .in('receipt_id', ids)
+      .order('line_no', { ascending: true })
+      .then((r) => r, () => ({ data: [] as Row[] })),
     clientIds.length
       ? supabase.from('clients').select('id, client_code, official_name').in('id', clientIds)
       : Promise.resolve({ data: [] as Row[] }),
@@ -91,6 +102,10 @@ async function loadData() {
   for (const t of txnRes.data ?? []) {
     (txnByRec[t.receipt_id] ??= []).push(t);
   }
+  const lineByRec: Record<string, Row[]> = {};
+  for (const l of lineRes.data ?? []) {
+    (lineByRec[l.receipt_id] ??= []).push(l);
+  }
   const clientById: Record<string, Row> = {};
   for (const c of clientRes.data ?? []) clientById[c.id] = c;
   const officeById: Record<string, Row> = {};
@@ -108,7 +123,7 @@ async function loadData() {
     }
   }
 
-  return { recs, fieldsByRec, imgByRec, txnByRec, clientById, officeById, signed };
+  return { recs, fieldsByRec, imgByRec, txnByRec, lineByRec, clientById, officeById, signed };
 }
 
 function renderCard(r: Row, d: Awaited<ReturnType<typeof loadData>>): string {
@@ -175,6 +190,50 @@ function renderCard(r: Row, d: Awaited<ReturnType<typeof loadData>>): string {
       <table class="txns">
         <thead><tr><th>利用日</th><th>利用先</th><th>金額</th></tr></thead>
         <tbody>${rows || '<tr><td colspan="3">明細なし</td></tr>'}</tbody>
+      </table>`;
+  } else if (docType === 'inventory') {
+    const lines = d.lineByRec[r.id] ?? [];
+    const total = lines.reduce((s, l) => s + (Number(l.amount) || 0), 0);
+    const rows = lines
+      .map(
+        (l) => `<tr${(l.confidence != null && Number(l.confidence) < 0.7) ? ' class="low"' : ''}>
+        <td class="desc">${esc(l.label ?? '')}</td>
+        <td class="num">${l.quantity ?? ''}</td>
+        <td class="num">${yen(l.unit_price)}</td>
+        <td class="num">${yen(l.amount)}</td></tr>`,
+      )
+      .join('');
+    body = `
+      <div class="meta">
+        <span class="vendor">棚卸表</span>
+        <span class="date">${esc(fmtDate(r.issued_date))}・${lines.length}品目・在庫金額 ${yen(total)}</span>
+      </div>
+      <table class="txns">
+        <thead><tr><th>品名</th><th>数量</th><th>単価</th><th>金額</th></tr></thead>
+        <tbody>${rows || '<tr><td colspan="4">明細なし</td></tr>'}</tbody>
+      </table>`;
+  } else if (docType === 'loan_schedule') {
+    const lines = d.lineByRec[r.id] ?? [];
+    const lender = fields['vendor'];
+    const rows = lines
+      .map(
+        (l) => `<tr${(l.confidence != null && Number(l.confidence) < 0.7) ? ' class="low"' : ''}>
+        <td>${esc(l.label ?? '')}</td>
+        <td>${esc(fmtDate(l.line_date))}</td>
+        <td class="num">${yen(l.amount)}</td>
+        <td class="num">${yen(l.principal)}</td>
+        <td class="num">${yen(l.interest)}</td>
+        <td class="num">${yen(l.balance)}</td></tr>`,
+      )
+      .join('');
+    body = `
+      <div class="meta">
+        <span class="vendor">${esc(lender ?? '借入金返済予定表')}</span>
+        <span class="date">${lines.length}回分</span>
+      </div>
+      <table class="txns">
+        <thead><tr><th>回</th><th>返済日</th><th>返済額</th><th>元金</th><th>利息</th><th>残高</th></tr></thead>
+        <tbody>${rows || '<tr><td colspan="6">明細なし</td></tr>'}</tbody>
       </table>`;
   } else {
     // 取引先＝顧問先から見た相手方（売上なら宛名、経費なら発行元）
@@ -301,6 +360,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     ['tax_payment', '納付書'],
     ['credit_card', 'カード'],
     ['bankbook', '通帳'],
+    ['inventory', '棚卸'],
+    ['loan_schedule', '返済表'],
+    ['balance_certificate', '残高証明'],
   ];
   const typeTabs = typeDefs
     .map(([val, label]) => {
