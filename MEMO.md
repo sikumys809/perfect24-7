@@ -57,3 +57,32 @@ Generated on 2026-06-08
 
 ---
 Generated on 2026-06-10
+
+---
+
+# 作業メモ（2026-06-10 続き）— マルチテナント Phase 1+2 実装
+
+## 今日実装したこと（コードは main にコミット済み・**マイグレーション未適用**）
+- **Phase 1（非破壊・migration 006/007）**
+  - `offices` テーブル新設（`office_code` 自動採番 O-001…、`name`、`line_destination`、`line_channel_secret`/`line_channel_access_token`（検証中NULL）、`is_active`）
+  - `clients.office_id`（ON DELETE CASCADE）/ `receipts.office_id`（ON DELETE SET NULL）追加
+  - 007 で森下敦史税理士事務所を office#1 登録（`line_destination` = `U50dbe9322ddef634d7883912ab7b6c20`、`GET /v2/bot/info` で取得済）＋既存 clients/receipts を backfill。冪等
+- **Phase 2（振り分け・api/line-webhook.ts）**
+  - webhook の `destination`（botのuserID）→ `offices` 引き当て → その事務所のチャネル秘密で署名検証、トークンで返信
+  - 顧問先の引き当て・登録コード照合を事務所スコープに限定（マルチテナント分離）
+  - receipts/bank_transactions に `office_id` を付与
+  - **完全後方互換**：`offices` 行が無い／未解決なら env のトークンで従来どおり単一事務所動作（`office_id` 列は付けない）。よってマイグレーション未適用でも本番は壊れない
+  - 事務所トークンは DB にあれば優先・無ければ env フォールバック（＝Phase 2の「env→DB移行」は DB に値を入れた時点で自動的に切替）
+
+## 次にやること（ここから再開）
+- **マイグレーション適用**：Supabase SQL Editor で `006_offices.sql` → `007_seed_office_1.sql` の順に実行（適用後、PostgREST のスキーマキャッシュ反映を待つ）
+- 適用後、LINE で実機テスト（友達追加→登録コード→領収書/通帳送信）して office_id が付くか確認
+- 事務所トークンの DB 移行（検証が落ち着いたら office#1 の secret/token を offices に投入し、env 依存をなくす）。外部事務所を入れる直前に暗号化
+- 2社目の追加手順：LINE公式アカウント＋Messaging APIチャネルを手作業作成 → `GET /v2/bot/info` で destination 取得 → `offices` に1行 INSERT（コード変更ゼロ）
+
+## 運用メモ（追加）
+- DBマイグレーション適用状況：001〜005 適用済み、**006・007 は未適用**
+- office#1 の line_destination 取得は `.env` のアクセストークンで `curl GET https://api.line.me/v2/bot/info`（displayName=森下敦史税理士事務所 を確認済）
+
+---
+Generated on 2026-06-10
