@@ -18,6 +18,7 @@ const DOC_LABEL: Record<string, string> = {
   bankbook: '通帳',
   credit_card: 'カード明細',
   tax_payment: '納付書',
+  balance_certificate: '残高証明',
   other: 'その他',
 };
 const DOC_COLOR: Record<string, string> = {
@@ -26,6 +27,7 @@ const DOC_COLOR: Record<string, string> = {
   bankbook: '#0d9488',
   credit_card: '#db2777',
   tax_payment: '#ea580c',
+  balance_certificate: '#0891b2',
   other: '#6b7280',
 };
 
