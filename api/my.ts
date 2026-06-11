@@ -120,6 +120,33 @@ const PAGE_HEAD = `<meta charset="utf-8"><meta name="viewport" content="width=de
   .login input { width:100%; font-size:1.15rem; letter-spacing:.15em; text-align:center; padding:12px; border:1px solid #cbd5e1; border-radius:10px; text-transform:uppercase; }
   .login button { width:100%; margin-top:12px; font-size:1rem; font-weight:700; padding:12px; border:none; border-radius:10px; background:#2563eb; color:#fff; cursor:pointer; }
   .login .err { color:#dc2626; font-size:.85rem; margin-top:10px; text-align:center; }
+  .mgmt { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:14px; margin-bottom:14px; }
+  .pnl { display:flex; gap:8px; }
+  .pnl .p { flex:1; text-align:center; }
+  .pnl .pl { font-size:.72rem; color:var(--muted); }
+  .pnl .pv { font-size:1.2rem; font-weight:800; margin-top:2px; }
+  .pnl .pv.sales { color:#047857; } .pnl .pv.expense { color:#1e40af; } .pnl .pv.profit { color:#0f172a; } .pnl .pv.neg { color:#dc2626; }
+  .note { font-size:.72rem; color:#b45309; background:#fffbeb; border:1px solid #fde68a; border-radius:8px; padding:6px 9px; margin:10px 0 4px; line-height:1.5; }
+  .msec { margin-top:12px; }
+  .mh { font-size:.82rem; font-weight:700; color:#334155; margin-bottom:7px; display:flex; align-items:center; }
+  .leg { margin-left:auto; font-size:.7rem; color:var(--muted); font-weight:400; }
+  .leg i { display:inline-block; width:9px; height:9px; border-radius:2px; vertical-align:middle; margin:0 3px 0 8px; }
+  .leg .ls { background:#10b981; } .leg .le { background:#3b82f6; }
+  .brow { display:flex; align-items:center; gap:8px; margin-bottom:5px; }
+  .brow .bn { flex:0 0 90px; font-size:.8rem; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .brow .bbar { flex:1; background:#f1f5f9; border-radius:5px; height:10px; overflow:hidden; }
+  .brow .bbar i { display:block; height:100%; background:#3b82f6; }
+  .brow .ba { flex:0 0 auto; font-size:.82rem; font-weight:700; font-variant-numeric:tabular-nums; }
+  .trow { display:flex; align-items:center; gap:8px; margin-bottom:6px; }
+  .trow .tm { flex:0 0 36px; font-size:.78rem; color:var(--muted); }
+  .trow .tbars { flex:1; display:flex; flex-direction:column; gap:2px; }
+  .trow .tbar { background:#f1f5f9; border-radius:3px; height:7px; overflow:hidden; }
+  .trow .tbar i { display:block; height:100%; }
+  .trow .tbar .bs { background:#10b981; } .trow .tbar .be { background:#3b82f6; }
+  .trow .tp { flex:0 0 64px; text-align:right; font-size:.8rem; font-weight:700; font-variant-numeric:tabular-nums; color:#047857; }
+  .trow .tp.neg { color:#dc2626; }
+  .subtally { margin-top:10px; font-size:.78rem; color:var(--muted); text-align:right; }
+  .muted { color:var(--muted); font-size:.82rem; }
 </style>`;
 
 function loginPage(error?: string): string {
@@ -150,21 +177,24 @@ async function renderDashboard(clientId: string, fType: string): Promise<string>
   // 自分の書類のみ（最新200件）
   const { data: receipts } = await supabase
     .from('receipts')
-    .select('id, document_type, direction, total_amount, issued_date, created_at')
+    .select('id, document_type, direction, total_amount, issued_date, created_at, account_code')
     .eq('client_id', clientId)
     .order('created_at', { ascending: false })
-    .limit(200);
+    .limit(400);
   const recs: Row[] = receipts ?? [];
   const ids = recs.map((r) => r.id);
 
-  const [fieldsRes, imgRes] = await Promise.all([
+  const [fieldsRes, imgRes, acctRes] = await Promise.all([
     ids.length
       ? supabase.from('extracted_fields').select('receipt_id, field_name, field_value').in('receipt_id', ids)
       : Promise.resolve({ data: [] as Row[] }),
     ids.length
       ? supabase.from('receipt_images').select('receipt_id, storage_path, content_type').in('receipt_id', ids)
       : Promise.resolve({ data: [] as Row[] }),
+    supabase.from('account_titles').select('code, name').then((r) => r, () => ({ data: [] as Row[] })),
   ]);
+  const accountName: Record<string, string> = {};
+  for (const a of acctRes.data ?? []) accountName[a.code] = a.name;
   const fieldsByRec: Record<string, Record<string, string>> = {};
   for (const f of fieldsRes.data ?? []) (fieldsByRec[f.receipt_id] ??= {})[f.field_name] = f.field_value;
   const imgByRec: Record<string, Row> = {};
@@ -194,6 +224,41 @@ async function renderDashboard(clientId: string, fType: string): Promise<string>
     thisMonth.filter((r) => r.direction === dir && r.document_type !== 'bankbook').reduce((s, r) => s + (Number(r.total_amount) || 0), 0);
   const monthExpense = sumDir('expense');
   const monthSales = sumDir('sales');
+
+  // ───────── 経営の見える化（参考値）─────────
+  // 損益に効く書類のみ（通帳・カード・固定資産・残高証明などは二重計上/資産のため除外）。
+  // 税込ベースの概算。正式な試算表は事務所側で算出する。
+  const PNL_TYPES = new Set(['receipt', 'invoice', 'tax_payment', 'ec_payout', 'payslip', 'wage_ledger']);
+  const pnl = meaningful.filter((r) => PNL_TYPES.has(r.document_type));
+  const monthKey = (r: Row) => String(r.issued_date ?? r.created_at ?? '').slice(0, 7);
+
+  // 直近6ヶ月の推移
+  const months: string[] = [];
+  for (let i = 5; i >= 0; i--) {
+    const d = new Date(Date.UTC(jst.getUTCFullYear(), jst.getUTCMonth() - i, 1));
+    months.push(`${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`);
+  }
+  const trend: Record<string, { sales: number; expense: number }> = {};
+  for (const m of months) trend[m] = { sales: 0, expense: 0 };
+  for (const r of pnl) {
+    const m = monthKey(r);
+    if (!(m in trend)) continue;
+    const amt = Number(r.total_amount) || 0;
+    if (r.direction === 'sales') trend[m].sales += amt;
+    else if (r.direction === 'expense') trend[m].expense += amt;
+  }
+
+  // 今月の科目別 経費内訳
+  const expByAcct: Record<string, number> = {};
+  for (const r of pnl) {
+    if (r.direction !== 'expense' || monthKey(r) !== ym) continue;
+    const code = r.account_code || 'other';
+    expByAcct[code] = (expByAcct[code] ?? 0) + (Number(r.total_amount) || 0);
+  }
+  const expBreakdown = Object.entries(expByAcct)
+    .map(([code, amt]) => ({ name: accountName[code] ?? '未分類', amt }))
+    .sort((a, b) => b.amt - a.amt);
+  const monthProfit = monthSales - monthExpense;
 
   // 種別タブ
   const present = [...new Set(meaningful.map((r) => r.document_type ?? 'other'))];
@@ -239,6 +304,46 @@ async function renderDashboard(clientId: string, fType: string): Promise<string>
         .join('')
     : '<div class="empty">まだ書類がありません。LINE で領収書・請求書を撮って送ってください。</div>';
 
+  // 経営の見える化パネル（参考値）
+  const maxTrend = Math.max(1, ...months.map((m) => Math.max(trend[m].sales, trend[m].expense)));
+  const trendRows = months
+    .map((m) => {
+      const t = trend[m];
+      const profit = t.sales - t.expense;
+      return `<div class="trow">
+        <span class="tm">${esc(m.slice(5))}月</span>
+        <div class="tbars">
+          <div class="tbar"><i class="bs" style="width:${((t.sales / maxTrend) * 100).toFixed(1)}%"></i></div>
+          <div class="tbar"><i class="be" style="width:${((t.expense / maxTrend) * 100).toFixed(1)}%"></i></div>
+        </div>
+        <span class="tp ${profit < 0 ? 'neg' : ''}">${profit >= 0 ? '+' : '−'}${Math.abs(Math.round(profit)).toLocaleString()}</span>
+      </div>`;
+    })
+    .join('');
+  const maxExp = Math.max(1, ...expBreakdown.map((e) => e.amt));
+  const breakdownRows =
+    expBreakdown
+      .slice(0, 6)
+      .map(
+        (e) => `<div class="brow">
+        <span class="bn">${esc(e.name)}</span>
+        <div class="bbar"><i style="width:${((e.amt / maxExp) * 100).toFixed(1)}%"></i></div>
+        <span class="ba">${yen(e.amt)}</span>
+      </div>`,
+      )
+      .join('') || '<div class="muted">今月の経費はまだありません。</div>';
+  const mgmt = `<div class="mgmt">
+    <div class="pnl">
+      <div class="p"><div class="pl">今月の売上</div><div class="pv sales">${monthSales ? '¥' + monthSales.toLocaleString() : '—'}</div></div>
+      <div class="p"><div class="pl">今月の経費</div><div class="pv expense">${monthExpense ? '¥' + monthExpense.toLocaleString() : '—'}</div></div>
+      <div class="p"><div class="pl">今月の利益</div><div class="pv ${monthProfit < 0 ? 'neg' : 'profit'}">${(monthProfit >= 0 ? '¥' : '−¥') + Math.abs(Math.round(monthProfit)).toLocaleString()}</div></div>
+    </div>
+    <div class="note">※ LINEで送っていただいた書類からの概算（税込）です。正式な試算表・申告は事務所にご確認ください。</div>
+    <div class="msec"><div class="mh">今月の経費の内訳</div>${breakdownRows}</div>
+    <div class="msec"><div class="mh">月次の推移（直近6ヶ月）<span class="leg"><i class="ls"></i>売上<i class="le"></i>経費</span></div>${trendRows}</div>
+    <div class="subtally">今月の提出 ${monthCount} 件</div>
+  </div>`;
+
   return `<!doctype html><html lang="ja"><head>${PAGE_HEAD}<title>マイ書類｜パーフェクト24/7</title></head><body>
 <header>
   <h1>マイ書類</h1>
@@ -246,11 +351,7 @@ async function renderDashboard(clientId: string, fType: string): Promise<string>
   <a class="logout" href="/api/my?logout=1">ログアウト</a>
 </header>
 <div class="wrap">
-  <div class="tally">
-    <div class="box"><div class="n">${monthCount}</div><div class="l">今月の提出</div></div>
-    <div class="box"><div class="n">${monthExpense ? '¥' + monthExpense.toLocaleString() : '—'}</div><div class="l">今月の経費</div></div>
-    ${monthSales ? `<div class="box"><div class="n">¥${monthSales.toLocaleString()}</div><div class="l">今月の売上</div></div>` : ''}
-  </div>
+  ${mgmt}
   <div class="filterbar">${tabs}</div>
   ${cards}
 </div>
