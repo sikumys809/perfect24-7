@@ -1,6 +1,6 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 import { createClient } from '@supabase/supabase-js';
-import { loadAccounts, type Account } from './_lib/accounting';
+import { loadAccounts, type Account } from './lib/accounting';
 
 // 1書類の編集エンドポイント。
 //  GET  /api/edit?id=<receipt_id>&...filters  → 編集フォーム（自動更新なし）

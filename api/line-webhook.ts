@@ -3,7 +3,7 @@ import crypto from 'node:crypto';
 import { waitUntil } from '@vercel/functions';
 import { createClient } from '@supabase/supabase-js';
 import Anthropic from '@anthropic-ai/sdk';
-import { loadAccounts, autoAccount, type Account } from './_lib/accounting';
+import { loadAccounts, autoAccount, type Account } from './lib/accounting';
 
 // LINE署名を生データで検証するため、Vercelの自動body解析を無効化
 // 大きめPDFの解析に時間がかかるため実行上限を延長（Hobbyの上限60秒）

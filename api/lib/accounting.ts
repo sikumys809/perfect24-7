@@ -1,6 +1,10 @@
 // 勘定科目の自動付与と、簡易複式での仕訳導出を担う共有ロジック。
-// webhook（自動付与）/ reports（元帳・試算表）/ edit（科目候補）から使う。
-// ※ /api/_lib は Vercel のルーティング対象外（_ 始まりは関数化されない）。
+// webhook（自動付与）/ reports（元帳・試算表）/ edit（科目候補）から import して使う。
+// 注意: Vercel は api/ 直下の各 .ts を個別にコンパイルする。共有モジュールを _lib のような
+//   underscore ディレクトリに置くとビルドから除外され、import 先の .js が実行時に見つからず
+//   FUNCTION_INVOCATION_FAILED になる。そのため underscore を付けず api/lib/ に置く。
+//   （結果としてこのファイルも /api/lib/accounting というルートになるが、末尾の default export
+//    で 404 を返すだけの無害なエンドポイントになる。）
 
 import type { SupabaseClient } from '@supabase/supabase-js';
 
@@ -267,4 +271,9 @@ export function deriveEntries(
   if (split) lines.push({ date, account_code: CODE.tax_paid, debit: tax, credit: 0, counterparty, description: '仮払消費税' });
   lines.push({ date, account_code: payCode, debit: 0, credit: amount, counterparty, description: note });
   return lines;
+}
+
+// このファイルは共有ロジック。Vercel 上ではルート化されるため、直接アクセス時は 404 を返す。
+export default function handler(_req: any, res: any) {
+  res.status(404).send('Not found');
 }

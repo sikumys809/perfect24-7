@@ -6,7 +6,7 @@ import {
   JOURNAL_DOC_TYPES,
   type Account,
   type JournalLine,
-} from './_lib/accounting';
+} from './lib/accounting';
 
 // 月次試算表(BS/PL)と総勘定元帳。受信書類に付与した勘定科目から簡易複式の仕訳を導出して集計する。
 //  GET /api/reports?view=trial|ledger&month=YYYY-MM&client=<id>&key=...
