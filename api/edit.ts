@@ -103,21 +103,32 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     if (!id) return res.status(400).send('id が必要です。');
 
     const direction = b.direction === 'sales' || b.direction === 'expense' ? b.direction : null;
+    const total = num(b.total_amount);
+    const tax = num(b.tax_amount);
+    // 税抜本体 amount は 税込−消費税 で再計算（reports/CSV の整合のため）
+    const net = total != null && tax != null ? total - tax : total;
     const patch: Record<string, unknown> = {
       account_code: b.account_code || null,
       payment_account_code: b.payment_account_code || null,
       account_source: 'manual',
       direction,
-      total_amount: num(b.total_amount),
+      total_amount: total,
+      tax_amount: tax,
+      amount: net,
       issued_date: typeof b.issued_date === 'string' && b.issued_date ? b.issued_date : null,
       description: b.note || null,
     };
     await supabase.from('receipts').update(patch).eq('id', id);
 
-    // counterparty / note / needs_review は extracted_fields 側
+    // 明細的な項目は extracted_fields 側に upsert
     await setField(id, 'counterparty', String(b.counterparty ?? '').trim() || null);
     await setField(id, 'note', String(b.note ?? '').trim() || null);
     await setField(id, 'direction', direction);
+    await setField(id, 'tax_amount', tax != null ? String(tax) : null);
+    await setField(id, 'tax_rate', String(b.tax_rate ?? '').trim() || null);
+    await setField(id, 'registration_number', String(b.registration_number ?? '').trim() || null);
+    await setField(id, 'receipt_no', String(b.receipt_no ?? '').trim() || null);
+    await setField(id, 'fee', num(b.fee) != null ? String(num(b.fee)) : null);
     // 「確認済みにする」がチェックされていれば要確認を解除
     await setField(id, 'needs_review', b.reviewed ? 'false' : 'true');
 
@@ -132,7 +143,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   const [{ data: rec }, fieldsRes] = await Promise.all([
     supabase
       .from('receipts')
-      .select('id, document_type, direction, total_amount, issued_date, account_code, payment_account_code, office_id, client_id')
+      .select('id, document_type, direction, total_amount, tax_amount, issued_date, account_code, payment_account_code, office_id, client_id')
       .eq('id', id)
       .single(),
     supabase.from('extracted_fields').select('field_name, field_value').eq('receipt_id', id),
@@ -239,9 +250,41 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       </div>
     </div>
 
-    <div class="row">
-      <label>取引先</label>
-      <input type="text" name="counterparty" value="${esc(counterparty)}">
+    <div class="row two">
+      <div>
+        <label>消費税額</label>
+        <input type="number" name="tax_amount" value="${esc(rec.tax_amount ?? '')}" step="1">
+      </div>
+      <div>
+        <label>税率</label>
+        <select name="tax_rate">
+          ${['', '10%', '8%', 'mixed']
+            .map((v) => `<option value="${esc(v)}"${(fields['tax_rate'] ?? '') === v ? ' selected' : ''}>${v === '' ? '（未設定）' : v === 'mixed' ? '複数税率' : v}</option>`)
+            .join('')}
+        </select>
+      </div>
+    </div>
+
+    <div class="row two">
+      <div>
+        <label>インボイス登録番号</label>
+        <input type="text" name="registration_number" value="${esc(fields['registration_number'] ?? '')}" placeholder="T+13桁">
+      </div>
+      <div>
+        <label>手数料</label>
+        <input type="number" name="fee" value="${esc(fields['fee'] ?? '')}" step="1">
+      </div>
+    </div>
+
+    <div class="row two">
+      <div>
+        <label>取引先</label>
+        <input type="text" name="counterparty" value="${esc(counterparty)}">
+      </div>
+      <div>
+        <label>番号（レシート/請求書番号）</label>
+        <input type="text" name="receipt_no" value="${esc(fields['receipt_no'] ?? '')}">
+      </div>
     </div>
 
     <div class="row">
