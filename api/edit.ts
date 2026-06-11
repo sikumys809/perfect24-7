@@ -65,6 +65,16 @@ function num(v: unknown): number | null {
 }
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
+  try {
+    return await run(req, res);
+  } catch (err: any) {
+    // 一時診断: 実エラーを画面に出す（原因特定後に除去）
+    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+    return res.status(500).send('EDIT_ERROR\n' + String(err?.stack ?? err));
+  }
+}
+
+async function run(req: VercelRequest, res: VercelResponse) {
   const keyEnforced = DASHBOARD_KEY.length > 0;
   const key = (req.method === 'POST' ? req.body?.key : req.query.key) ?? '';
   if (keyEnforced && key !== DASHBOARD_KEY) {
