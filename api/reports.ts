@@ -1,12 +1,115 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 import { createClient } from '@supabase/supabase-js';
-import {
-  loadAccounts,
-  deriveEntries,
-  JOURNAL_DOC_TYPES,
-  type Account,
-  type JournalLine,
-} from './lib/accounting';
+
+// 注意: この Vercel 設定では api/ 内の相互 import が実行時に解決されない（各ファイルが個別
+// トランスパイルされ兄弟ファイルがバンドルされない）ため、会計ロジックはここにインラインで持つ。
+// 正本の説明は元の設計コメント参照。勘定科目コードは 011_account_titles.sql と一致。
+type Account = {
+  code: string;
+  name: string;
+  category: 'asset' | 'liability' | 'equity' | 'revenue' | 'expense';
+  statement: 'BS' | 'PL';
+  normal_balance: 'debit' | 'credit';
+  sort_order: number | null;
+};
+type JournalLine = {
+  date: string | null;
+  account_code: string;
+  debit: number;
+  credit: number;
+  counterparty: string;
+  description: string;
+};
+const CODE = {
+  cash: '1010', bank: '1020', receivable: '1040', payable: '2020', deposit_received: '2040',
+  sales: '4010', salary: '6020', fee: '6160', tax_paid: '1080', tax_received: '2080',
+};
+const JOURNAL_DOC_TYPES = new Set([
+  'receipt', 'invoice', 'tax_payment', 'fixed_asset', 'ec_payout', 'payslip', 'wage_ledger',
+]);
+
+async function loadAccounts(sb: any, officeId: string | null): Promise<Account[]> {
+  const { data } = await sb
+    .from('account_titles')
+    .select('code, name, category, statement, normal_balance, sort_order, office_id, is_active')
+    .or(officeId ? `office_id.is.null,office_id.eq.${officeId}` : 'office_id.is.null')
+    .eq('is_active', true);
+  const rows = (data ?? []) as (Account & { office_id: string | null })[];
+  const byCode = new Map<string, Account>();
+  for (const r of rows) {
+    const existing = byCode.get(r.code);
+    if (!existing || r.office_id) byCode.set(r.code, r);
+  }
+  return [...byCode.values()].sort((a, b) => (a.sort_order ?? 0) - (b.sort_order ?? 0));
+}
+
+// receipt 1件（＋給与なら payroll_lines）から簡易複式の仕訳行を導出。
+// taxMode='exclusive'（税抜経理）は消費税を仮払/仮受消費税に分ける。
+function deriveEntries(
+  rec: any,
+  fields: Record<string, string>,
+  accountByCode: Map<string, Account>,
+  payrollLines?: any[],
+  taxMode: 'inclusive' | 'exclusive' = 'inclusive',
+): JournalLine[] {
+  const docType = rec.document_type as string;
+  if (!JOURNAL_DOC_TYPES.has(docType)) return [];
+  const date: string | null = rec.issued_date ?? null;
+  const counterparty = fields['counterparty'] ?? fields['vendor'] ?? '';
+  const mainCode = rec.account_code as string | null;
+  const payCode = (rec.payment_account_code as string | null) ?? CODE.cash;
+  const amount = Number(rec.total_amount) || 0;
+
+  if ((docType === 'payslip' || docType === 'wage_ledger') && payrollLines) {
+    const gross = payrollLines.reduce((s, p) => s + (Number(p.gross) || 0), 0);
+    const deduct = payrollLines.reduce(
+      (s, p) =>
+        s + (Number(p.health_insurance) || 0) + (Number(p.pension) || 0) +
+        (Number(p.employment_insurance) || 0) + (Number(p.income_tax) || 0) +
+        (Number(p.resident_tax) || 0) + (Number(p.other_deduction) || 0),
+      0,
+    );
+    const net = gross - deduct;
+    const lines: JournalLine[] = [];
+    if (gross > 0) lines.push({ date, account_code: CODE.salary, debit: gross, credit: 0, counterparty, description: '給与' });
+    if (deduct > 0) lines.push({ date, account_code: CODE.deposit_received, debit: 0, credit: deduct, counterparty, description: '源泉・社保等 預り' });
+    if (net > 0) lines.push({ date, account_code: payCode, debit: 0, credit: net, counterparty, description: '差引支給' });
+    return lines;
+  }
+
+  if (docType === 'ec_payout') {
+    const fee = Number(fields['fee']) || 0;
+    const netAmt = Number(fields['net_amount']);
+    const net = Number.isFinite(netAmt) ? netAmt : amount - fee;
+    const lines: JournalLine[] = [];
+    if (net > 0) lines.push({ date, account_code: payCode, debit: net, credit: 0, counterparty, description: '入金' });
+    if (fee > 0) lines.push({ date, account_code: CODE.fee, debit: fee, credit: 0, counterparty, description: '決済手数料' });
+    if (amount > 0) lines.push({ date, account_code: CODE.sales, debit: 0, credit: amount, counterparty, description: '売上' });
+    return lines;
+  }
+
+  if (!mainCode || amount <= 0) return [];
+  const main = accountByCode.get(mainCode);
+  const note = fields['note'] ?? '';
+  const tax = Number(rec.tax_amount) || 0;
+  const split = taxMode === 'exclusive' && tax > 0 && tax < amount;
+  const net = split ? amount - tax : amount;
+
+  if (main && main.normal_balance === 'credit') {
+    const lines: JournalLine[] = [
+      { date, account_code: payCode, debit: amount, credit: 0, counterparty, description: note },
+      { date, account_code: mainCode, debit: 0, credit: net, counterparty, description: note },
+    ];
+    if (split) lines.push({ date, account_code: CODE.tax_received, debit: 0, credit: tax, counterparty, description: '仮受消費税' });
+    return lines;
+  }
+  const lines: JournalLine[] = [
+    { date, account_code: mainCode, debit: net, credit: 0, counterparty, description: note },
+  ];
+  if (split) lines.push({ date, account_code: CODE.tax_paid, debit: tax, credit: 0, counterparty, description: '仮払消費税' });
+  lines.push({ date, account_code: payCode, debit: 0, credit: amount, counterparty, description: note });
+  return lines;
+}
 
 // 月次試算表(BS/PL)と総勘定元帳。受信書類に付与した勘定科目から簡易複式の仕訳を導出して集計する。
 //  GET /api/reports?view=trial|ledger&month=YYYY-MM&client=<id>&key=...

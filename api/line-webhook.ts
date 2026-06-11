@@ -3,7 +3,107 @@ import crypto from 'node:crypto';
 import { waitUntil } from '@vercel/functions';
 import { createClient } from '@supabase/supabase-js';
 import Anthropic from '@anthropic-ai/sdk';
-import { loadAccounts, autoAccount, type Account } from './lib/accounting';
+// 注意: この Vercel 設定では api/ 内の相互 import が実行時に解決されない（各ファイルが個別
+// トランスパイルされ兄弟ファイルがバンドルされない）ため、会計ロジックはここにインラインで持つ。
+// 勘定科目コードは 011_account_titles.sql と一致。
+type Account = {
+  code: string;
+  name: string;
+  category: 'asset' | 'liability' | 'equity' | 'revenue' | 'expense';
+  statement: 'BS' | 'PL';
+  normal_balance: 'debit' | 'credit';
+  sort_order: number | null;
+};
+const ACC = {
+  cash: '1010', bank: '1020', receivable: '1040', payable: '2020',
+  deposit_received: '2040', sales: '4010', salary: '6020',
+  travel: '6070', entertainment: '6080', meeting: '6090', communication: '6100',
+  supplies: '6110', office_supplies: '6120', utilities: '6130', rent: '6140',
+  fee: '6160', tax_public: '6170', ad: '6190', repair: '6200', insurance: '6210',
+  books: '6220', freight: '6240', vehicle: '6250',
+};
+const ASSET_CATEGORY_CODE: [RegExp, string][] = [
+  [/建物附属|附属設備/, '1520'], [/建物/, '1510'], [/機械|装置/, '1530'],
+  [/車両|車輌|運搬具/, '1540'], [/ソフト|software/i, '1560'], [/工具|器具|備品/, '1550'],
+];
+const TAX_KIND_CODE: [RegExp, string][] = [
+  [/源泉|住民/, ACC.deposit_received],
+  [/法人税|地方法人|事業税|都道府県民|市町村民/, '9010'],
+  [/社会保険|健康保険|厚生年金|労働保険|雇用保険/, '6040'],
+];
+const EXPENSE_KEYWORDS: [RegExp, string][] = [
+  [/タクシー|ＪＲ|JR|新幹線|鉄道|電車|地下鉄|バス|航空|ANA|JAL|高速|ETC|駐車|パーキング|Suica|PASMO|ｓｕｉｃａ/i, ACC.travel],
+  [/ガソリン|給油|エネオス|ENEOS|出光|コスモ石油|シェル/i, ACC.vehicle],
+  [/ドコモ|ＮＴＴ|NTT|ソフトバンク|softbank|au|KDDI|携帯|電話|インターネット|プロバイダ|wifi|Wi-Fi/i, ACC.communication],
+  [/電力|電気|東京電力|関西電力|中部電力|ガス|都市ガス|水道/i, ACC.utilities],
+  [/家賃|賃料|テナント|管理費|共益費|月極/i, ACC.rent],
+  [/ヤマト|佐川|日本郵便|ゆうパック|郵便|宅配|運送|配送/i, ACC.freight],
+  [/書店|書房|新聞|出版|kindle|Kindle/i, ACC.books],
+  [/広告|チラシ|印刷|Google\s?Ads|Facebook|Meta|リスティング/i, ACC.ad],
+  [/保険/i, ACC.insurance],
+  [/修理|修繕|メンテナンス/i, ACC.repair],
+  [/振込手数料|支払手数料|手数料|決済手数料/i, ACC.fee],
+  [/スターバックス|スタバ|ドトール|喫茶|カフェ|珈琲|コーヒー/i, ACC.meeting],
+  [/居酒屋|レストラン|飲食|接待|料亭|寿司|焼肉/i, ACC.entertainment],
+  [/文具|文房具|事務用品|コクヨ|アスクル/i, ACC.office_supplies],
+];
+
+async function loadAccounts(sb: any, officeId: string | null): Promise<Account[]> {
+  const { data } = await sb
+    .from('account_titles')
+    .select('code, name, category, statement, normal_balance, sort_order, office_id, is_active')
+    .or(officeId ? `office_id.is.null,office_id.eq.${officeId}` : 'office_id.is.null')
+    .eq('is_active', true);
+  const rows = (data ?? []) as (Account & { office_id: string | null })[];
+  const byCode = new Map<string, Account>();
+  for (const r of rows) {
+    const existing = byCode.get(r.code);
+    if (!existing || r.office_id) byCode.set(r.code, r);
+  }
+  return [...byCode.values()].sort((a, b) => (a.sort_order ?? 0) - (b.sort_order ?? 0));
+}
+
+// 売上/経費の向きと書類種別から、主たる科目と相手科目を自動決定。suggested はLLM提案の科目名。
+function autoAccount(
+  ex: any,
+  docType: string | null,
+  direction: 'sales' | 'expense' | null,
+  accounts: Account[],
+  suggested?: string | null,
+): { accountCode: string | null; paymentCode: string | null; matchedSuggestion: boolean } {
+  const byName = new Map(accounts.map((a) => [a.name, a]));
+  const isInvoice = docType === 'invoice';
+  if (docType === 'fixed_asset') {
+    const cat = String(ex?.asset_category ?? '');
+    const code = ASSET_CATEGORY_CODE.find(([re]) => re.test(cat))?.[1] ?? '1550';
+    return { accountCode: code, paymentCode: ACC.payable, matchedSuggestion: false };
+  }
+  if (docType === 'tax_payment') {
+    const kind = String(ex?.tax_kind ?? '');
+    const code = TAX_KIND_CODE.find(([re]) => re.test(kind))?.[1] ?? ACC.tax_public;
+    return { accountCode: code, paymentCode: ACC.cash, matchedSuggestion: false };
+  }
+  if (docType === 'ec_payout') {
+    return { accountCode: ACC.sales, paymentCode: ACC.bank, matchedSuggestion: false };
+  }
+  if (docType === 'payslip' || docType === 'wage_ledger') {
+    return { accountCode: ACC.salary, paymentCode: ACC.cash, matchedSuggestion: false };
+  }
+  if (direction === 'sales') {
+    return { accountCode: ACC.sales, paymentCode: isInvoice ? ACC.receivable : ACC.cash, matchedSuggestion: false };
+  }
+  let accountCode: string | null = null;
+  let matched = false;
+  if (suggested && byName.has(suggested)) {
+    const a = byName.get(suggested)!;
+    if (a.category === 'expense' || a.category === 'asset') { accountCode = a.code; matched = true; }
+  }
+  if (!accountCode) {
+    const hay = `${ex?.vendor ?? ''} ${ex?.note ?? ''}`;
+    accountCode = EXPENSE_KEYWORDS.find(([re]) => re.test(hay))?.[1] ?? ACC.supplies;
+  }
+  return { accountCode, paymentCode: isInvoice ? ACC.payable : ACC.cash, matchedSuggestion: matched };
+}
 
 // LINE署名を生データで検証するため、Vercelの自動body解析を無効化
 // 大きめPDFの解析に時間がかかるため実行上限を延長（Hobbyの上限60秒）
