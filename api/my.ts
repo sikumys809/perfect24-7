@@ -62,6 +62,15 @@ function verify(value: string | undefined): string | null {
   const b = Buffer.from(expect);
   return a.length === b.length && crypto.timingSafeEqual(a, b) ? clientId : null;
 }
+// 登録コードの正規化: 全角英数字→半角、空白(全角含む)・ハイフン除去、大文字化。
+// 日本語IMEで全角入力されても一致するようにする。
+function normCode(s: unknown): string {
+  return String(s ?? '')
+    .replace(/[！-～]/g, (ch) => String.fromCharCode(ch.charCodeAt(0) - 0xfee0))
+    .replace(/[\s　\-­]/g, '')
+    .toUpperCase();
+}
+
 function parseCookies(req: VercelRequest): Record<string, string> {
   const out: Record<string, string> = {};
   const raw = req.headers.cookie;
@@ -258,7 +267,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
   // ログイン（登録コード）
   if (req.method === 'POST' && req.body?.action === 'login') {
-    const code = String(req.body?.code ?? '').trim().toUpperCase();
+    const code = normCode(req.body?.code);
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
     if (!code) return res.status(400).send(loginPage('登録コードを入力してください。'));
     const { data } = await supabase
