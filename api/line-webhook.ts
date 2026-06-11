@@ -3,6 +3,7 @@ import crypto from 'node:crypto';
 import { waitUntil } from '@vercel/functions';
 import { createClient } from '@supabase/supabase-js';
 import Anthropic from '@anthropic-ai/sdk';
+import { loadAccounts, autoAccount, type Account } from './_lib/accounting';
 
 // LINE署名を生データで検証するため、Vercelの自動body解析を無効化
 // 大きめPDFの解析に時間がかかるため実行上限を延長（Hobbyの上限60秒）
@@ -109,6 +110,7 @@ document_type が receipt / invoice / tax_payment / balance_certificate / fixed_
       "useful_life": "fixed_asset のときの耐用年数（年。記載があれば数値）。無ければ null",
       "net_amount": "ec_payout のときの入金額（総売上から手数料を差し引いた振込額。数値のみ）。それ以外は null",
       "note": "但し書き（例: 御飲食代として）。無ければ null",
+      "account": "この取引に最も近い勘定科目名を、末尾【勘定科目の候補】から1つだけ選ぶ（経費なら費用科目、売上なら収益科目）。候補に無い/判断できないなら null",
       "confidence": "その1件の抽出の自信度を 0〜1 の数値で"
     }
   ]
@@ -393,15 +395,26 @@ function validatePayroll(rows: PayRow[]): { notes: string[]; badLines: number[] 
 }
 
 // 画像/PDF を Claude Opus 4.8 に渡して構造化データ（複数件）を抽出
-async function extractDocument(buffer: Buffer, contentType: string, clientName?: string): Promise<any> {
+async function extractDocument(
+  buffer: Buffer,
+  contentType: string,
+  clientName?: string,
+  accounts?: Account[],
+): Promise<any> {
   const today = new Date().toISOString().slice(0, 10);
   // 提出者（顧問先）名が分かれば、売上/経費の向き判定に使わせる
   const directionHint = clientName
     ? `\n\n【提出者】この書類を送ってきた顧問先（提出者）は「${clientName}」です。各証憑の direction を次の基準で判定してください: 発行元（vendor）が「${clientName}」＝顧問先自身なら sales（売上）。宛名/支払側が「${clientName}」、または発行元が他社（仕入先・店舗など）なら expense（経費）。会社名は表記揺れ（株式会社/(株)/前株後株/支店名）があり得るので柔軟に判断。確信が持てなければ null。`
     : '';
+  // 勘定科目の候補（費用・収益）を提示して account を選ばせる。マスタが無ければ提示しない。
+  const expenseNames = (accounts ?? []).filter((a) => a.category === 'expense').map((a) => a.name);
+  const revenueNames = (accounts ?? []).filter((a) => a.category === 'revenue').map((a) => a.name);
+  const accountHint = expenseNames.length
+    ? `\n\n【勘定科目の候補】各 receipts[].account は次の候補から最も近いものを1つだけ選んでください。\n費用科目: ${expenseNames.join('、')}\n収益科目: ${revenueNames.join('、')}\n迷う場合・候補に無い場合は null（後で事務所が修正します）。`
+    : '';
   const prompt = `${EXTRACTION_PROMPT}
 
-今日は ${today} です。日付の2桁年（例:「26」）は西暦の下2桁とみなし、今日に最も近い年として解釈してください（例: 今日が2026年なら「26-05-18」は 2026-05-18）。和暦（令和/平成）表記は西暦に変換してください。${directionHint}`;
+今日は ${today} です。日付の2桁年（例:「26」）は西暦の下2桁とみなし、今日に最も近い年として解釈してください（例: 今日が2026年なら「26-05-18」は 2026-05-18）。和暦（令和/平成）表記は西暦に変換してください。${directionHint}${accountHint}`;
 
   const isPdf = contentType.includes('pdf');
   const allowed = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
@@ -442,6 +455,7 @@ type SaveCtx = {
   clientId?: string | null; // どの顧問先の書類か
   clientName?: string | null; // 顧問先名（売上/経費の向き判定のフォールバック用）
   officeId?: string | null; // どの事務所宛か（未解決=null。後方互換のため null なら列を付けない）
+  accounts?: Account[]; // 事務所の勘定科目マスタ（科目自動付与用。未適用なら空）
 };
 
 // 会社名の表記揺れを吸収して比較するための正規化（法人格・空白を除去）
@@ -527,6 +541,26 @@ async function saveReceipt(ex: any, ctx: SaveCtx): Promise<string> {
   // direction は別ステートメントで更新（migration 008 未適用でも本体保存を壊さない。
   // 列が無ければこの update だけ失敗し、向きは extracted_fields 側に残る）。
   await supabase.from('receipts').update({ direction }).eq('id', receipt?.id);
+
+  // 勘定科目の自動付与（残高証明書は仕訳対象外なのでスキップ）。
+  // migration 011 未適用でも本体保存を壊さないよう別ステートメント＆try で握りつぶす。
+  if (!isBalance && ctx.accounts && ctx.accounts.length) {
+    const acc = autoAccount(ex, ctx.docType ?? null, noDir ? null : direction, ctx.accounts, ex?.account);
+    if (acc.accountCode) {
+      try {
+        await supabase
+          .from('receipts')
+          .update({
+            account_code: acc.accountCode,
+            payment_account_code: acc.paymentCode,
+            account_source: 'auto',
+          })
+          .eq('id', receipt?.id);
+      } catch {
+        /* 列が無ければ無視 */
+      }
+    }
+  }
 
   const fieldRows = (
     [
@@ -898,8 +932,16 @@ async function savePayroll(
   if (low > 0) notes.push(`信頼度が低い行が${low}件`);
   const needsReview = notes.length > 0;
 
-  // 給与は人件費=経費。total_amount=総支給合計
+  // 給与は人件費=経費。total_amount=総支給合計。科目=給料手当(6020)/相手=現金(1010)
   await supabase.from('receipts').update({ direction: 'expense', total_amount: total }).eq('id', receipt?.id);
+  try {
+    await supabase
+      .from('receipts')
+      .update({ account_code: '6020', payment_account_code: '1010', account_source: 'auto' })
+      .eq('id', receipt?.id);
+  } catch {
+    /* 列が無ければ無視 */
+  }
 
   const fieldRows: any[] = [
     { receipt_id: receipt?.id ?? null, field_name: 'direction', field_value: 'expense', source: 'claude-opus-4-8' },
@@ -1072,6 +1114,14 @@ async function processWebhookEvents(bodyText: string, ctx: ReqCtx) {
   const payload = JSON.parse(bodyText);
   const events = payload.events || [];
 
+  // 事務所の勘定科目マスタを1回だけ取得（科目の自動付与に使う。未適用なら空配列）
+  let accounts: Account[] = [];
+  try {
+    accounts = await loadAccounts(supabase, ctx.officeId);
+  } catch {
+    /* マスタ未作成なら自動付与なしで続行 */
+  }
+
   for (const ev of events) {
     try {
       const lineUserId = ev?.source?.userId ?? null;
@@ -1144,12 +1194,13 @@ async function processWebhookEvents(bodyText: string, ctx: ReqCtx) {
         clientId: client.id,
         clientName: client.official_name,
         officeId: ctx.officeId,
+        accounts,
       };
 
       // 抽出（複数件）
       let doc: any;
       try {
-        doc = await extractDocument(buffer, contentType, client.official_name);
+        doc = await extractDocument(buffer, contentType, client.official_name, accounts);
       } catch (exErr) {
         console.error('Extraction error:', exErr);
         await saveUnprocessed(saveCtx, String(exErr));

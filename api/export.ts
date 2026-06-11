@@ -49,7 +49,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   const fDir = typeof req.query.dir === 'string' ? req.query.dir : '';
   let q = supabase
     .from('receipts')
-    .select('id, document_type, direction, total_amount, tax_amount, issued_date, created_at, client_id')
+    .select('id, document_type, direction, total_amount, tax_amount, issued_date, created_at, client_id, account_code')
     .order('created_at', { ascending: false })
     .limit(500);
   if (fType) q = q.eq('document_type', fType);
@@ -64,7 +64,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   const ids = recs.map((r) => r.id);
   const clientIds = [...new Set(recs.map((r) => r.client_id).filter(Boolean))];
 
-  const [fieldsRes, txnRes, lineRes, payRes, clientRes] = await Promise.all([
+  const [fieldsRes, txnRes, lineRes, payRes, clientRes, accountRes] = await Promise.all([
     ids.length
       ? supabase.from('extracted_fields').select('receipt_id, field_name, field_value').in('receipt_id', ids)
       : Promise.resolve({ data: [] as Row[] }),
@@ -94,6 +94,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     clientIds.length
       ? supabase.from('clients').select('id, client_code, official_name').in('id', clientIds)
       : Promise.resolve({ data: [] as Row[] }),
+    supabase.from('account_titles').select('code, name').then((r) => r, () => ({ data: [] as Row[] })),
   ]);
 
   const fieldsByRec: Record<string, Record<string, string>> = {};
@@ -106,6 +107,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   for (const p of payRes.data ?? []) (payByRec[p.receipt_id] ??= []).push(p);
   const clientById: Record<string, Row> = {};
   for (const c of clientRes.data ?? []) clientById[c.id] = c;
+  const accountName: Record<string, string> = {};
+  for (const a of accountRes.data ?? []) accountName[a.code] = a.name;
 
   const clientName = (r: Row) => (r.client_id ? clientById[r.client_id]?.official_name ?? '' : '');
   const clientCode = (r: Row) => (r.client_id ? clientById[r.client_id]?.client_code ?? '' : '');
@@ -209,7 +212,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   } else {
     // 領収書・請求書（および種別未指定の通帳以外）
     const header = [
-      '受信日時', '顧問先ID', '顧問先', '売上経費', '種別', '日付', '取引先', '発行元', '宛名',
+      '受信日時', '顧問先ID', '顧問先', '売上経費', '勘定科目', '種別', '日付', '取引先', '発行元', '宛名',
       '税込金額', '消費税', '手数料', '入金額', '税率', '税目', '対象期間', '資産名', '資産区分', '耐用年数',
       '登録番号', '番号', '但し書き', '要確認', '検算メモ',
     ];
@@ -225,6 +228,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         const f = fieldsByRec[r.id] ?? {};
         return [
           jst(r.created_at), clientCode(r), clientName(r), dirLabel(r.direction),
+          r.account_code ? accountName[r.account_code] ?? r.account_code : '',
           DOC_LABEL[r.document_type as string] ?? r.document_type ?? '',
           fmtDate(r.issued_date), f['counterparty'] ?? f['vendor'] ?? '', f['vendor'] ?? '', f['recipient'] ?? '',
           r.total_amount ?? '', r.tax_amount ?? '', f['fee'] ?? '', f['net_amount'] ?? '', f['tax_rate'] ?? '',

@@ -66,17 +66,17 @@ async function loadData() {
   // 最新100件の書類
   const { data: receipts } = await supabase
     .from('receipts')
-    .select('id, document_type, direction, total_amount, tax_amount, amount, issued_date, created_at, client_id, office_id')
+    .select('id, document_type, direction, total_amount, tax_amount, amount, issued_date, created_at, client_id, office_id, account_code, payment_account_code, account_source')
     .order('created_at', { ascending: false })
     .limit(100);
   const recs: Row[] = receipts ?? [];
-  if (recs.length === 0) return { recs, fieldsByRec: {}, imgByRec: {}, txnByRec: {}, lineByRec: {}, payByRec: {}, clientById: {}, officeById: {}, signed: {} };
+  if (recs.length === 0) return { recs, fieldsByRec: {}, imgByRec: {}, txnByRec: {}, lineByRec: {}, payByRec: {}, clientById: {}, officeById: {}, accountName: {}, signed: {} };
 
   const ids = recs.map((r) => r.id);
   const clientIds = [...new Set(recs.map((r) => r.client_id).filter(Boolean))];
   const officeIds = [...new Set(recs.map((r) => r.office_id).filter(Boolean))];
 
-  const [fieldsRes, imgRes, txnRes, lineRes, payRes, clientRes, officeRes] = await Promise.all([
+  const [fieldsRes, imgRes, txnRes, lineRes, payRes, clientRes, officeRes, accountRes] = await Promise.all([
     supabase.from('extracted_fields').select('receipt_id, field_name, field_value').in('receipt_id', ids),
     supabase.from('receipt_images').select('receipt_id, storage_path, content_type').in('receipt_id', ids),
     supabase
@@ -104,6 +104,11 @@ async function loadData() {
     officeIds.length
       ? supabase.from('offices').select('id, office_code, name').in('id', officeIds)
       : Promise.resolve({ data: [] as Row[] }),
+    // 勘定科目マスタ（code→name 表示用）。未作成でも落ちないよう握りつぶす
+    supabase
+      .from('account_titles')
+      .select('code, name')
+      .then((r) => r, () => ({ data: [] as Row[] })),
   ]);
 
   // receipt_id ごとに項目をまとめる
@@ -131,6 +136,8 @@ async function loadData() {
   for (const c of clientRes.data ?? []) clientById[c.id] = c;
   const officeById: Record<string, Row> = {};
   for (const o of officeRes.data ?? []) officeById[o.id] = o;
+  const accountName: Record<string, string> = {};
+  for (const a of accountRes.data ?? []) accountName[a.code] = a.name;
 
   // 画像の署名URL（非公開バケットを安全に表示。1時間有効）
   const paths = Object.values(imgByRec)
@@ -144,10 +151,10 @@ async function loadData() {
     }
   }
 
-  return { recs, fieldsByRec, imgByRec, txnByRec, lineByRec, payByRec, clientById, officeById, signed };
+  return { recs, fieldsByRec, imgByRec, txnByRec, lineByRec, payByRec, clientById, officeById, accountName, signed };
 }
 
-function renderCard(r: Row, d: Awaited<ReturnType<typeof loadData>>): string {
+function renderCard(r: Row, d: Awaited<ReturnType<typeof loadData>>, editHref: (id: string) => string): string {
   const fields = d.fieldsByRec[r.id] ?? {};
   const img = d.imgByRec[r.id];
   const signedUrl = img ? d.signed[img.storage_path] : undefined;
@@ -160,6 +167,13 @@ function renderCard(r: Row, d: Awaited<ReturnType<typeof loadData>>): string {
 
   const needsReview = fields['needs_review'] === 'true';
   const notes = fields['validation_notes'];
+
+  // 勘定科目バッジ（自動付与/手修正）。マスタ名が引ければ表示
+  const acctName = r.account_code ? d.accountName[r.account_code] ?? r.account_code : '';
+  const acctManual = r.account_source === 'manual';
+  const acctBadge = acctName
+    ? `<span class="acct${acctManual ? ' manual' : ''}" title="${acctManual ? '事務所が修正' : '自動付与'}">${esc(acctName)}</span>`
+    : '';
 
   // サムネイル
   let thumb: string;
@@ -322,8 +336,10 @@ function renderCard(r: Row, d: Awaited<ReturnType<typeof loadData>>): string {
       <div class="top">
         <span class="badge" style="background:${color}">${esc(label)}</span>
         ${docType !== 'bankbook' && r.direction ? `<span class="side ${r.direction === 'sales' ? 'sales' : 'expense'}">${r.direction === 'sales' ? '売上' : '経費'}</span>` : ''}
+        ${acctBadge}
         ${client ? `<span class="client">${esc(client.official_name)} <small>${esc(client.client_code)}</small></span>` : ''}
         ${needsReview ? `<span class="review">⚠️ 要確認</span>` : ''}
+        <a class="edit" href="${esc(editHref(r.id))}">✎ 編集</a>
       </div>
       ${body}
       ${needsReview && notes ? `<div class="notes">${esc(notes)}</div>` : ''}
@@ -490,8 +506,29 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     .filter(Boolean)
     .join(' ・ ');
 
+  // 編集リンク（現在のフィルタ＋key を維持して /api/edit へ）
+  const editHref = (id: string) => {
+    const p = new URLSearchParams();
+    p.set('id', id);
+    if (fType) p.set('type', fType);
+    if (fDir) p.set('dir', fDir);
+    if (fClient) p.set('client', fClient);
+    if (fq) p.set('q', fq);
+    if (showAll) p.set('all', '1');
+    if (key) p.set('key', key);
+    return '/api/edit?' + p.toString();
+  };
+  // レポート（試算表・元帳）へのリンク。顧問先・key を引き継ぐ
+  const reportHref = (view: string) => {
+    const p = new URLSearchParams();
+    p.set('view', view);
+    if (fClient) p.set('client', fClient);
+    if (key) p.set('key', key);
+    return '/api/reports?' + p.toString();
+  };
+
   const cards = displayRecs.length
-    ? displayRecs.map((r) => renderCard(r, d)).join('\n')
+    ? displayRecs.map((r) => renderCard(r, d, editHref)).join('\n')
     : '<div class="empty">該当する書類がありません。LINE で領収書・請求書・通帳を送ってください。</div>';
 
   const html = `<!doctype html>
@@ -507,6 +544,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   header { position:sticky; top:0; background:#0f172a; color:#fff; padding:14px 18px; display:flex; align-items:baseline; gap:14px; flex-wrap:wrap; z-index:10; }
   header h1 { font-size:1.05rem; margin:0; font-weight:700; }
   header .sum { color:#cbd5e1; font-size:.85rem; }
+  header .reports { display:flex; gap:8px; }
+  header .reports a { color:#e2e8f0; text-decoration:none; font-size:.8rem; border:1px solid #334155; padding:4px 10px; border-radius:8px; }
+  header .reports a:hover { background:#1e293b; }
   header .live { margin-left:auto; font-size:.75rem; color:#34d399; }
   .wrap { max-width:1100px; margin:0 auto; padding:16px; }
   .card { display:flex; gap:14px; background:var(--card); border:1px solid var(--line); border-radius:14px; padding:14px; margin-bottom:12px; box-shadow:0 1px 2px rgba(0,0,0,.04); }
@@ -519,6 +559,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   .client { font-size:.85rem; color:var(--muted); }
   .client small { color:#94a3b8; }
   .review { color:#b45309; background:#fef3c7; font-size:.72rem; font-weight:700; padding:2px 8px; border-radius:999px; }
+  .acct { color:#3730a3; background:#e0e7ff; font-size:.72rem; font-weight:700; padding:2px 9px; border-radius:999px; }
+  .acct.manual { color:#065f46; background:#d1fae5; }
+  .edit { margin-left:auto; color:#2563eb; text-decoration:none; font-size:.78rem; font-weight:700; border:1px solid #bfdbfe; padding:2px 9px; border-radius:8px; }
+  .edit:hover { background:#eff6ff; }
   .side { font-size:.72rem; font-weight:700; padding:2px 9px; border-radius:999px; }
   .side.sales { color:#047857; background:#d1fae5; }
   .side.expense { color:#1e40af; background:#dbeafe; }
@@ -559,6 +603,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 <header>
   <h1>証憑ダッシュボード</h1>
   <span class="sum">${esc(summary)}</span>
+  <nav class="reports">
+    <a href="${reportHref('trial')}">📊 試算表</a>
+    <a href="${reportHref('ledger')}">📒 総勘定元帳</a>
+  </nav>
   <span class="live">● 20秒ごとに自動更新</span>
 </header>
 ${filterBar}
