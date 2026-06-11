@@ -1,6 +1,31 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 import { createClient } from '@supabase/supabase-js';
-import { loadAccounts, type Account } from './lib/accounting';
+// 注意: このプロジェクトの Vercel 設定では api/ 内の相互 import が実行時に解決されない
+// （各ファイルが個別トランスパイルされ、兄弟ファイルがバンドルされない）ため、
+// 必要なロジックはこのファイル内にインラインで持つ。
+type Account = {
+  code: string;
+  name: string;
+  category: 'asset' | 'liability' | 'equity' | 'revenue' | 'expense';
+  statement: 'BS' | 'PL';
+  normal_balance: 'debit' | 'credit';
+  sort_order: number | null;
+};
+
+async function loadAccounts(sb: ReturnType<typeof createClient>, officeId: string | null): Promise<Account[]> {
+  const { data } = await sb
+    .from('account_titles')
+    .select('code, name, category, statement, normal_balance, sort_order, office_id, is_active')
+    .or(officeId ? `office_id.is.null,office_id.eq.${officeId}` : 'office_id.is.null')
+    .eq('is_active', true);
+  const rows = (data ?? []) as (Account & { office_id: string | null })[];
+  const byCode = new Map<string, Account>();
+  for (const r of rows) {
+    const existing = byCode.get(r.code);
+    if (!existing || r.office_id) byCode.set(r.code, r);
+  }
+  return [...byCode.values()].sort((a, b) => (a.sort_order ?? 0) - (b.sort_order ?? 0));
+}
 
 // 1書類の編集エンドポイント。
 //  GET  /api/edit?id=<receipt_id>&...filters  → 編集フォーム（自動更新なし）
