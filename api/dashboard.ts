@@ -59,16 +59,37 @@ function yen(n: unknown): string {
 function fmtDate(d: unknown): string {
   return typeof d === 'string' && d ? d.slice(0, 10) : '—';
 }
+function ymd(d: Date): string {
+  return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
+}
+// 月(YYYY-MM) → [初日, 末日]
+function monthRange(ym: string): { from: string; to: string } {
+  const [y, m] = ym.split('-').map(Number);
+  return { from: `${ym}-01`, to: ymd(new Date(Date.UTC(y, m, 0))) };
+}
+// 決算月(end:1-12) から事業年度の範囲。offset=0で当期、1で前期…
+function fyRange(end: number, offset: number): { from: string; to: string; label: string } {
+  const jst = new Date(Date.now() + 9 * 3600 * 1000);
+  const ty = jst.getUTCFullYear();
+  const tm = jst.getUTCMonth() + 1; // 1-12
+  let endYear = tm <= end ? ty : ty + 1; // 当期の決算年
+  endYear -= offset;
+  const to = new Date(Date.UTC(endYear, end, 0)); // 決算月の末日
+  const from = new Date(Date.UTC(endYear - 1, end, 1)); // 決算月の翌月初（= end を0基準indexに使うと翌月）
+  return { from: ymd(from), to: ymd(to), label: `${from.getUTCFullYear()}/${from.getUTCMonth() + 1}〜${to.getUTCFullYear()}/${to.getUTCMonth() + 1}期` };
+}
 
 type Row = Record<string, any>;
 
-async function loadData() {
-  // 最新100件の書類
-  const { data: receipts } = await supabase
+async function loadData(period?: { from: string; to: string }) {
+  // 期間指定があれば issued_date で範囲抽出、無ければ最新100件
+  let rq = supabase
     .from('receipts')
-    .select('id, document_type, direction, total_amount, tax_amount, amount, issued_date, created_at, client_id, office_id, account_code, payment_account_code, account_source')
-    .order('created_at', { ascending: false })
-    .limit(100);
+    .select('id, document_type, direction, total_amount, tax_amount, amount, issued_date, created_at, client_id, office_id, account_code, payment_account_code, account_source');
+  rq = period
+    ? rq.gte('issued_date', period.from).lte('issued_date', period.to).order('issued_date', { ascending: false }).limit(1000)
+    : rq.order('created_at', { ascending: false }).limit(100);
+  const { data: receipts } = await rq;
   const recs: Row[] = receipts ?? [];
   if (recs.length === 0) return { recs, fieldsByRec: {}, imgByRec: {}, txnByRec: {}, lineByRec: {}, payByRec: {}, clientById: {}, officeById: {}, accountName: {}, signed: {} };
 
@@ -411,15 +432,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return res.status(200).send(renderClientsPage(clients ?? [], typeof req.query.key === 'string' ? req.query.key : ''));
   }
 
-  let d: Awaited<ReturnType<typeof loadData>>;
-  try {
-    d = await loadData();
-  } catch (err) {
-    console.error('dashboard load error', err);
-    res.setHeader('Content-Type', 'text/html; charset=utf-8');
-    return res.status(500).send('<!doctype html><meta charset="utf-8"><body style="font-family:sans-serif;padding:2rem">データ取得でエラーが発生しました。</body>');
-  }
-
   // フィルタ用パラメータ
   const showAll = req.query.all === '1';
   const fType = typeof req.query.type === 'string' ? req.query.type : '';
@@ -428,17 +440,49 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   const fq = (typeof req.query.q === 'string' ? req.query.q : '').trim();
   const key = typeof req.query.key === 'string' ? req.query.key : '';
 
+  // 期間フィルタ: from/to（任意期間）優先、無ければ month（YYYY-MM）。どちらも無ければ最新100件。
+  const qFrom = typeof req.query.from === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(req.query.from) ? req.query.from : '';
+  const qTo = typeof req.query.to === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(req.query.to) ? req.query.to : '';
+  const qMonth = typeof req.query.month === 'string' && /^\d{4}-\d{2}$/.test(req.query.month) ? req.query.month : '';
+  let period: { from: string; to: string } | undefined;
+  let periodLabel = '';
+  if (qFrom && qTo) { period = { from: qFrom, to: qTo }; periodLabel = `${qFrom}〜${qTo}`; }
+  else if (qMonth) { period = monthRange(qMonth); periodLabel = qMonth; }
+
+  // 事業年度クイックリンク用に、選択中の顧問先の決算月を取得
+  let fyEndMonth: number | null = null;
+  if (fClient) {
+    const { data: cf } = await supabase.from('clients').select('fiscal_end_month').eq('id', fClient).single();
+    const m = Number(cf?.fiscal_end_month);
+    fyEndMonth = m >= 1 && m <= 12 ? m : null;
+  }
+
+  let d: Awaited<ReturnType<typeof loadData>>;
+  try {
+    d = await loadData(period);
+  } catch (err) {
+    console.error('dashboard load error', err);
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    return res.status(500).send('<!doctype html><meta charset="utf-8"><body style="font-family:sans-serif;padding:2rem">データ取得でエラーが発生しました。</body>');
+  }
+
   // 現在のフィルタを維持したままパラメータを差し替えるURLを作る
-  const withParams = (ov: { type?: string; dir?: string; client?: string; q?: string }) => {
+  const withParams = (ov: { type?: string; dir?: string; client?: string; q?: string; from?: string; to?: string; month?: string }) => {
     const p = new URLSearchParams();
     const t = ov.type !== undefined ? ov.type : fType;
     const dr = ov.dir !== undefined ? ov.dir : fDir;
     const c = ov.client !== undefined ? ov.client : fClient;
     const q = ov.q !== undefined ? ov.q : fq;
+    const fr = ov.from !== undefined ? ov.from : qFrom;
+    const tt = ov.to !== undefined ? ov.to : qTo;
+    const mo = ov.month !== undefined ? ov.month : qMonth;
     if (t) p.set('type', t);
     if (dr) p.set('dir', dr);
     if (c) p.set('client', c);
     if (q) p.set('q', q);
+    if (fr) p.set('from', fr);
+    if (tt) p.set('to', tt);
+    if (mo) p.set('month', mo);
     if (showAll) p.set('all', '1');
     if (key) p.set('key', key);
     const s = p.toString();
@@ -551,7 +595,28 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     <a class="csv" href="/api/export${withParams({})}">⬇ ${fType ? `CSVダウンロード（${displayRecs.length}）` : `全ジャンルCSV（ZIP）`}</a>
   </div>`;
 
+  // 期間フィルタのバー（月／任意期間／事業年度）。隠しフィールドで現在の絞り込みを維持
+  const hidden = `${key ? `<input type="hidden" name="key" value="${esc(key)}">` : ''}${fType ? `<input type="hidden" name="type" value="${esc(fType)}">` : ''}${fDir ? `<input type="hidden" name="dir" value="${esc(fDir)}">` : ''}${fClient ? `<input type="hidden" name="client" value="${esc(fClient)}">` : ''}${fq ? `<input type="hidden" name="q" value="${esc(fq)}">` : ''}${showAll ? `<input type="hidden" name="all" value="1">` : ''}`;
+  const fyLinks = fyEndMonth
+    ? [0, 1]
+        .map((off) => {
+          const r = fyRange(fyEndMonth as number, off);
+          const active = qFrom === r.from && qTo === r.to ? ' active' : '';
+          return `<a class="tab${active}" href="${withParams({ from: r.from, to: r.to, month: '' })}">${off === 0 ? '今期' : '前期'} <b>${esc(r.label)}</b></a>`;
+        })
+        .join('')
+    : '';
+  const periodBar = `
+  <div class="periodbar">
+    <span class="plabel">📅 期間</span>
+    <form class="pf" method="get">${hidden}<input type="month" name="month" value="${esc(qMonth)}" onchange="this.form.submit()"></form>
+    <form class="pf" method="get">${hidden}<input type="date" name="from" value="${esc(qFrom)}"> 〜 <input type="date" name="to" value="${esc(qTo)}"><button type="submit">期間で表示</button></form>
+    ${fyLinks ? `<span class="fy">${fyLinks}</span>` : fClient ? '' : '<span class="fyhint">事業年度は顧問先を選ぶと使えます</span>'}
+    ${period ? `<a class="clear" href="${withParams({ from: '', to: '', month: '' })}">期間クリア</a>` : '<span class="pcur">最新100件</span>'}
+  </div>`;
+
   const summary = [
+    periodLabel ? `期間 ${periodLabel}` : '',
     `${displayRecs.length} 件`,
     salesTotal ? `売上 ¥${salesTotal.toLocaleString()}` : '',
     expenseTotal ? `経費 ¥${expenseTotal.toLocaleString()}` : '',
@@ -657,6 +722,16 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   .filters button { font-size:.85rem; padding:6px 12px; border:none; border-radius:8px; background:#2563eb; color:#fff; cursor:pointer; }
   .filters .clear { font-size:.8rem; color:var(--muted); text-decoration:none; }
   .csv { margin-left:auto; text-decoration:none; font-size:.85rem; font-weight:700; color:#0d9488; border:1px solid #5eead4; background:#f0fdfa; padding:7px 14px; border-radius:9px; }
+  .periodbar { background:#f8fafc; border-bottom:1px solid var(--line); padding:8px 16px; display:flex; gap:10px; align-items:center; flex-wrap:wrap; position:sticky; top:96px; z-index:8; font-size:.85rem; }
+  .periodbar .plabel { font-weight:700; color:#475569; }
+  .periodbar .pf { display:flex; gap:6px; align-items:center; margin:0; }
+  .periodbar input[type=month], .periodbar input[type=date] { font-size:.85rem; padding:5px 8px; border:1px solid var(--line); border-radius:8px; }
+  .periodbar .pf button { font-size:.82rem; padding:5px 10px; border:none; border-radius:8px; background:#334155; color:#fff; cursor:pointer; }
+  .periodbar .fy { display:flex; gap:6px; }
+  .periodbar .fy .tab { font-size:.8rem; padding:4px 10px; }
+  .periodbar .fyhint, .periodbar .pcur { color:#94a3b8; font-size:.78rem; }
+  .periodbar .clear { color:#dc2626; text-decoration:none; font-size:.8rem; font-weight:700; }
+  @media (max-width:560px){ .periodbar{ top:auto; position:static } }
   @media (max-width:560px){ .thumb{ flex-basis:84px } .thumb img,.thumb .pdf,.thumb .noimg{ width:84px;height:84px } .amount{ font-size:1.25rem } .filterbar{ top:47px } .csv{ margin-left:0 } }
 </style>
 </head><body>
@@ -671,6 +746,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   <span class="live">● 20秒ごとに自動更新</span>
 </header>
 ${filterBar}
+${periodBar}
 <div class="wrap">
   ${cards}
 </div>

@@ -49,13 +49,22 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   const fClient = typeof req.query.client === 'string' ? req.query.client : '';
   const fq = (typeof req.query.q === 'string' ? req.query.q : '').trim().toLowerCase();
 
-  // 対象の書類を取得（最新500件まで）
+  // 期間（ダッシュボードと同じ from/to / month）。指定があれば issued_date で範囲抽出
+  const eFrom = typeof req.query.from === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(req.query.from) ? req.query.from : '';
+  const eTo = typeof req.query.to === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(req.query.to) ? req.query.to : '';
+  const eMonth = typeof req.query.month === 'string' && /^\d{4}-\d{2}$/.test(req.query.month) ? req.query.month : '';
+  let pFrom = '', pTo = '';
+  if (eFrom && eTo) { pFrom = eFrom; pTo = eTo; }
+  else if (eMonth) { const [y, m] = eMonth.split('-').map(Number); pFrom = `${eMonth}-01`; const d = new Date(Date.UTC(y, m, 0)); pTo = `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`; }
+
+  // 対象の書類を取得（期間指定時は範囲・最大2000件、無指定は最新500件）
   const fDir = typeof req.query.dir === 'string' ? req.query.dir : '';
   let q = supabase
     .from('receipts')
-    .select('id, document_type, direction, total_amount, tax_amount, issued_date, created_at, client_id, account_code')
-    .order('created_at', { ascending: false })
-    .limit(500);
+    .select('id, document_type, direction, total_amount, tax_amount, issued_date, created_at, client_id, account_code');
+  q = pFrom && pTo
+    ? q.gte('issued_date', pFrom).lte('issued_date', pTo).order('issued_date', { ascending: false }).limit(2000)
+    : q.order('created_at', { ascending: false }).limit(500);
   if (fType) q = q.eq('document_type', fType);
   if (fDir) q = q.eq('direction', fDir);
   if (fClient) q = q.eq('client_id', fClient);
