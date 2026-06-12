@@ -1065,22 +1065,34 @@ async function processUpload(
   filename: string,
   client: any,
   accounts: Account[],
+  existingPath?: string, // 署名付きURLで既にStorageへ直接アップ済みのパス。あれば再アップしない
 ): Promise<{ ok: boolean; message: string; docType?: string | null; review?: boolean }> {
   const isPdf = contentType.includes('pdf');
   const isImage = contentType.startsWith('image/');
-  if (!isPdf && !isImage) return { ok: false, message: '対応していない形式です（画像かPDFを送ってください）。' };
+  if (!isPdf && !isImage) {
+    if (existingPath) await supabase.storage.from('receipts').remove([existingPath]).catch(() => {});
+    return { ok: false, message: '対応していない形式です（画像かPDFを送ってください）。' };
+  }
 
   // 完全同一ファイルの重複弾き（SHA-256）
   const fileHash = crypto.createHash('sha256').update(buffer).digest('hex');
   const { data: dup } = await supabase.from('receipt_images').select('id').eq('image_sha256', fileHash).limit(1);
-  if (dup && dup.length > 0) return { ok: false, message: 'この書類は既に受信済みです。' };
+  if (dup && dup.length > 0) {
+    if (existingPath) await supabase.storage.from('receipts').remove([existingPath]).catch(() => {});
+    return { ok: false, message: 'この書類は既に受信済みです。' };
+  }
 
-  // Storage に保存（キーに使えない文字は置換）
-  const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
   const rand = crypto.randomBytes(4).toString('hex');
-  const path = `receipts/${timestamp}_up_${rand}${isPdf ? '.pdf' : ''}`;
-  const { error: upErr } = await supabase.storage.from('receipts').upload(path, buffer, { contentType });
-  if (upErr) throw upErr;
+  let path: string;
+  if (existingPath) {
+    path = existingPath; // 直接アップロード済み
+  } else {
+    // Storage に保存（キーに使えない文字は置換）
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+    path = `receipts/${timestamp}_up_${rand}${isPdf ? '.pdf' : ''}`;
+    const { error: upErr } = await supabase.storage.from('receipts').upload(path, buffer, { contentType });
+    if (upErr) throw upErr;
+  }
 
   const saveCtx: any = {
     messageId: filename || `アップロード_${rand}`,
@@ -1165,18 +1177,43 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (!client) return res.status(401).json({ ok: false, message: '顧問先が見つかりません。' });
 
   const body: any = req.body ?? {};
-  const dataBase64 = body.dataBase64;
   const contentType = typeof body.contentType === 'string' ? body.contentType : 'application/octet-stream';
   const filename = typeof body.filename === 'string' ? body.filename : '';
-  if (!dataBase64 || typeof dataBase64 !== 'string') return res.status(400).json({ ok: false, message: 'ファイルがありません。' });
+  const MAX_BYTES = 20 * 1024 * 1024; // 解析コスト・メモリ・Claude制限を考慮した上限(20MB)
 
   let buffer: Buffer;
-  try { buffer = Buffer.from(dataBase64, 'base64'); } catch { return res.status(400).json({ ok: false, message: 'ファイル形式エラー。' }); }
+  let existingPath: string | undefined;
+
+  if (typeof body.path === 'string' && body.path) {
+    // 署名付きURLで直接アップ済み → パスの署名を検証してStorageから取得
+    const path = body.path as string;
+    const sig = typeof body.sig === 'string' ? body.sig : '';
+    const expect = crypto.createHmac('sha256', SUPABASE_KEY).update(`${path}|${clientId}`).digest('base64url');
+    const a = Buffer.from(sig);
+    const b = Buffer.from(expect);
+    if (!(a.length === b.length && crypto.timingSafeEqual(a, b))) {
+      return res.status(403).json({ ok: false, message: '不正なリクエストです。' });
+    }
+    const { data: blob, error } = await supabase.storage.from('receipts').download(path);
+    if (error || !blob) return res.status(400).json({ ok: false, message: 'アップロードされたファイルが見つかりません。' });
+    buffer = Buffer.from(await blob.arrayBuffer());
+    existingPath = path;
+  } else {
+    // 小さいファイルは base64 を直接受ける
+    const dataBase64 = body.dataBase64;
+    if (!dataBase64 || typeof dataBase64 !== 'string') return res.status(400).json({ ok: false, message: 'ファイルがありません。' });
+    try { buffer = Buffer.from(dataBase64, 'base64'); } catch { return res.status(400).json({ ok: false, message: 'ファイル形式エラー。' }); }
+  }
+
   if (buffer.length === 0) return res.status(400).json({ ok: false, message: '空のファイルです。' });
+  if (buffer.length > MAX_BYTES) {
+    if (existingPath) await supabase.storage.from('receipts').remove([existingPath]).catch(() => {});
+    return res.status(413).json({ ok: false, message: 'ファイルが大きすぎます（20MBまで）。分割してお送りください。' });
+  }
 
   try {
     const accounts = await loadAccounts(supabase, client.office_id ?? null);
-    const result = await processUpload(buffer, contentType, filename, client, accounts);
+    const result = await processUpload(buffer, contentType, filename, client, accounts, existingPath);
     return res.status(200).json(result);
   } catch (e) {
     console.error('upload handler error', e);

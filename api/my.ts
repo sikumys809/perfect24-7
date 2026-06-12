@@ -206,19 +206,45 @@ const UPLOADER = `
     ['dragleave','dragend','drop'].forEach(function(e){dz.addEventListener(e,function(ev){ev.preventDefault();dz.classList.remove('drag');});});
     dz.addEventListener('drop',function(ev){var f=ev.dataTransfer&&ev.dataTransfer.files&&ev.dataTransfer.files[0];if(f)send(f);});
     inp.addEventListener('change',function(){if(inp.files&&inp.files[0])send(inp.files[0]);inp.value='';});
+
+    // 画像は送信前にブラウザで縮小（Claudeの5MB制限・速度・コストに効く）。PDFはそのまま。
+    function prepare(file){
+      return new Promise(function(resolve){
+        if(!/^image\\//.test(file.type)){resolve({blob:file,contentType:file.type||'application/pdf',filename:file.name});return;}
+        var url=URL.createObjectURL(file),img=new Image();
+        img.onload=function(){
+          URL.revokeObjectURL(url);
+          var max=2200,w=img.width,h=img.height,mx=Math.max(w,h);
+          if(mx<=max&&file.size<=1.5*1024*1024){resolve({blob:file,contentType:file.type,filename:file.name});return;}
+          var s=Math.min(1,max/mx),cw=Math.round(w*s),ch=Math.round(h*s);
+          var cv=document.createElement('canvas');cv.width=cw;cv.height=ch;
+          cv.getContext('2d').drawImage(img,0,0,cw,ch);
+          cv.toBlob(function(b){if(b)resolve({blob:b,contentType:'image/jpeg',filename:(file.name.replace(/\\.[^.]+$/,'')||'photo')+'.jpg'});else resolve({blob:file,contentType:file.type,filename:file.name});},'image/jpeg',0.85);
+        };
+        img.onerror=function(){URL.revokeObjectURL(url);resolve({blob:file,contentType:file.type,filename:file.name});};
+        img.src=url;
+      });
+    }
     function send(file){
-      if(file.size>3*1024*1024){show('ファイルが大きいようです（3MBまで）。大きい場合はLINEで送ってください。',true);setTimeout(hide,5000);return;}
-      show('アップロード中…\\n「'+file.name+'」');up.classList.add('upbusy');
-      var fr=new FileReader();
-      fr.onload=function(){
-        var b64=String(fr.result).split(',')[1]||'';
-        fetch('/api/upload',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({filename:file.name,contentType:file.type||'application/octet-stream',dataBase64:b64})})
-        .then(function(r){return r.json().catch(function(){return {ok:false,message:'通信エラー'};});})
-        .then(function(j){up.classList.remove('upbusy');show((j.ok?'✓ ':'⚠️ ')+(j.message||''),!j.ok);if(j.ok){setTimeout(function(){location.reload();},1600);}else{setTimeout(hide,5000);}})
-        .catch(function(){up.classList.remove('upbusy');show('アップロードに失敗しました。',true);setTimeout(hide,5000);});
-      };
-      fr.onerror=function(){up.classList.remove('upbusy');show('ファイルの読み込みに失敗しました。',true);setTimeout(hide,5000);};
-      fr.readAsDataURL(file);
+      if(file.size>20*1024*1024){show('ファイルが大きすぎます（20MBまで）。分割してお送りください。',true);setTimeout(hide,6000);return;}
+      up.classList.add('upbusy');show('準備中…\\n「'+file.name+'」');
+      var prep;
+      prepare(file).then(function(p){
+        prep=p;show('アップロード中…\\n「'+p.filename+'」');
+        return fetch('/api/upload-url',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({contentType:p.contentType})}).then(function(r){return r.json();});
+      }).then(function(u){
+        if(!u||!u.ok)throw (u&&u.message)||'URL発行に失敗';
+        return fetch(u.signedUrl,{method:'PUT',headers:{'Content-Type':prep.contentType,'x-upsert':'true'},body:prep.blob}).then(function(pr){
+          if(!pr.ok)throw 'アップロードに失敗';
+          show('解析中…（少々お待ちください）');
+          return fetch('/api/upload',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:u.path,sig:u.sig,contentType:prep.contentType,filename:prep.filename})}).then(function(r){return r.json().catch(function(){return {ok:false,message:'通信エラー'};});});
+        });
+      }).then(function(j){
+        up.classList.remove('upbusy');show((j.ok?'✓ ':'⚠️ ')+(j.message||''),!j.ok);
+        if(j.ok){setTimeout(function(){location.reload();},1800);}else{setTimeout(hide,6000);}
+      }).catch(function(e){
+        up.classList.remove('upbusy');show('⚠️ '+(typeof e==='string'?e:'アップロードに失敗しました'),true);setTimeout(hide,6000);
+      });
     }
   })();</script>`;
 
