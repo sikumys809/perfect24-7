@@ -598,6 +598,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   body { margin:0; background:var(--bg); color:var(--text); font-family:-apple-system,BlinkMacSystemFont,"Hiragino Kaku Gothic ProN","Noto Sans JP",sans-serif; }
   header { position:sticky; top:0; background:#0f172a; color:#fff; padding:14px 18px; display:flex; align-items:baseline; gap:14px; flex-wrap:wrap; z-index:10; }
   header h1 { font-size:1.05rem; margin:0; font-weight:700; }
+  header .logo { display:inline-flex; align-items:center; gap:6px; font-weight:800; letter-spacing:.01em; background:linear-gradient(90deg,#38bdf8,#818cf8); -webkit-background-clip:text; background-clip:text; color:transparent; }
+  header .logo .mk { -webkit-text-fill-color:initial; }
+  header .pipe { color:#334155; }
+  header .ttl { color:#cbd5e1; font-weight:600; font-size:.92rem; }
   header .sum { color:#cbd5e1; font-size:.85rem; }
   header .reports { display:flex; gap:8px; }
   header .reports a { color:#e2e8f0; text-decoration:none; font-size:.8rem; border:1px solid #334155; padding:4px 10px; border-radius:8px; }
@@ -657,7 +661,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 </style>
 </head><body>
 <header>
-  <h1>証憑ダッシュボード</h1>
+  <h1><span class="logo"><span class="mk">⚡</span>パーフェクト24/7</span> <span class="pipe">|</span> <span class="ttl">証憑ダッシュボード</span></h1>
   <span class="sum">${esc(summary)}</span>
   <nav class="reports">
     <a href="${reportHref('trial')}">📊 試算表</a>

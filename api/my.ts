@@ -365,10 +365,18 @@ type Row = Record<string, any>;
 async function renderDashboard(clientId: string, fType: string): Promise<string> {
   const { data: client } = await supabase
     .from('clients')
-    .select('id, client_code, official_name')
+    .select('id, client_code, official_name, office_id')
     .eq('id', clientId)
     .single();
   if (!client) return loginPage('セッションが無効です。もう一度ログインしてください。');
+
+  // 担当税理士事務所名（顧問先には事務所のオリジナルサービスに見せる＝安心感）
+  let officeName = '';
+  if (client.office_id) {
+    const { data: off } = await supabase.from('offices').select('name').eq('id', client.office_id).single();
+    officeName = off?.name ?? '';
+  }
+  const brand = officeName ? `${officeName} 記帳システム` : '記帳システム';
 
   // 自分の書類のみ（最新200件）
   const { data: receipts } = await supabase
@@ -553,8 +561,8 @@ async function renderDashboard(clientId: string, fType: string): Promise<string>
 
   return `<!doctype html><html lang="ja"><head>${PAGE_HEAD}<title>マイ書類｜パーフェクト24/7</title></head><body>
 <header>
-  <h1>マイ書類</h1>
-  <span class="who">${esc(client.official_name)}</span>
+  <h1>${esc(brand)}</h1>
+  <span class="who">${esc(client.official_name)} 様</span>
   <a class="logout" href="/api/my?info=1">基本情報</a>
   <a class="logout" href="/api/my?logout=1">ログアウト</a>
 </header>
