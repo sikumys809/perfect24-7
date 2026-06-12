@@ -15,7 +15,54 @@ const SUPABASE_KEY = process.env.SUPABASE_KEY ?? '';
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
 const COOKIE = 'p247_office';
-const ADMIN_KEY = process.env.ADMIN_KEY ?? ''; // 運営によるパスワードリセット用
+const ADMIN_KEY = process.env.ADMIN_KEY ?? ''; // 運営によるパスワードリセット用（メール未設定時のフォールバック）
+const RESEND_API_KEY = process.env.RESEND_API_KEY ?? ''; // パスワード再設定メールの送信
+const MAIL_FROM = process.env.MAIL_FROM ?? 'パーフェクト24/7 <onboarding@resend.dev>';
+const APP_ORIGIN = (process.env.APP_ORIGIN ?? 'https://perfect24-7.vercel.app').replace(/\/$/, '');
+
+// パスワード再設定トークン（DB不要・30分有効）。署名鍵に現在の password_hash を混ぜるため、
+// 再設定するとリンクは自動失効＝実質ワンタイム。
+function makeResetToken(officeId: string, passwordHash: string | null, nowMs: number): string {
+  const exp = nowMs + 30 * 60 * 1000;
+  const payload = `${officeId}.${exp}`;
+  const sig = crypto.createHmac('sha256', `${SUPABASE_KEY}:${passwordHash ?? ''}`).update(payload).digest('base64url');
+  return `${payload}.${sig}`;
+}
+async function verifyResetToken(token: string, nowMs: number): Promise<string | null> {
+  const parts = String(token).split('.');
+  if (parts.length !== 3) return null;
+  const [officeId, expStr, sig] = parts;
+  const exp = Number(expStr);
+  if (!exp || exp < nowMs) return null;
+  const { data } = await supabase.from('offices').select('id, password_hash, status').eq('id', officeId).single();
+  if (!data || data.status !== 'active') return null;
+  const expect = crypto.createHmac('sha256', `${SUPABASE_KEY}:${data.password_hash ?? ''}`).update(`${officeId}.${expStr}`).digest('base64url');
+  const a = Buffer.from(sig);
+  const b = Buffer.from(expect);
+  return a.length === b.length && crypto.timingSafeEqual(a, b) ? officeId : null;
+}
+async function sendResetEmail(to: string, link: string): Promise<boolean> {
+  if (!RESEND_API_KEY) return false;
+  try {
+    const r = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${RESEND_API_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        from: MAIL_FROM,
+        to: [to],
+        subject: '【パーフェクト24/7】パスワード再設定のご案内',
+        html: `<p>パスワード再設定のリクエストを受け付けました。</p>
+<p>下のボタン（リンク）から新しいパスワードを設定してください。<b>30分間有効</b>です。</p>
+<p><a href="${link}" style="display:inline-block;background:#2563eb;color:#fff;padding:10px 18px;border-radius:8px;text-decoration:none;font-weight:700">パスワードを再設定する</a></p>
+<p style="color:#64748b;font-size:13px">ボタンが押せない場合はこのURLを開いてください:<br>${link}</p>
+<p style="color:#64748b;font-size:13px">心当たりがない場合は、このメールを破棄してください。</p>`,
+      }),
+    });
+    return r.ok;
+  } catch {
+    return false;
+  }
+}
 
 function esc(s: unknown): string {
   return String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c] as string);
@@ -147,10 +194,32 @@ function changePwPage(o: { error?: string; info?: string } = {}): string {
   ${o.error ? `<div class="err">${esc(o.error)}</div>` : ''}${o.info ? `<div class="info">${esc(o.info)}</div>` : ''}
   <div class="center"><a href="/api/dashboard">← ダッシュボードへ</a></div>`);
 }
-function forgotPage(): string {
-  return shell('パスワードをお忘れの方', `<h2>パスワードをお忘れの方</h2>
-  <p class="note">セキュリティのため、パスワードはご自身でしか再設定できません。ログインできない場合は、お手数ですが<b>運営（パーフェクト24/7）までご連絡ください</b>。本人確認のうえ、リセットいたします。<br>リセット後は、ログイン画面で新しいパスワードを入力すると、それが新しいパスワードとして設定されます。</p>
+function forgotPage(o: { error?: string; info?: string } = {}): string {
+  return shell('パスワード再設定', `<h2>パスワード再設定</h2>
+  <p class="note">ご登録のメールアドレスを入力してください。パスワード再設定用のリンクをお送りします（30分間有効）。</p>
+  <form method="post" action="/api/office">
+    <input type="hidden" name="action" value="forgot">
+    <label>メールアドレス</label><input name="email" type="email" autocapitalize="off" required>
+    <button type="submit">再設定リンクを送る</button>
+  </form>
+  ${o.error ? `<div class="err">${esc(o.error)}</div>` : ''}${o.info ? `<div class="info">${esc(o.info)}</div>` : ''}
   <div class="center"><a href="/api/office">← ログインへ戻る</a></div>`);
+}
+function resetPwPage(token: string, o: { error?: string } = {}): string {
+  return shell('新しいパスワードの設定', `<h2>新しいパスワードの設定</h2>
+  <p class="note">新しいパスワードを入力してください（8文字以上）。</p>
+  <form method="post" action="/api/office">
+    <input type="hidden" name="action" value="resetpw">
+    <input type="hidden" name="token" value="${esc(token)}">
+    <label>新しいパスワード</label><input name="newpw" type="password" minlength="8" required>
+    <button type="submit">設定する</button>
+  </form>
+  ${o.error ? `<div class="err">${esc(o.error)}</div>` : ''}`);
+}
+function invalidResetPage(): string {
+  return shell('リンクが無効です', `<h2>リンクが無効か期限切れです</h2>
+  <p class="note">パスワード再設定リンクの有効期限は30分です。お手数ですが、もう一度お試しください。</p>
+  <div class="center"><a href="/api/office?forgot=1">再設定をやり直す</a></div>`);
 }
 function adminPage(o: { error?: string; info?: string } = {}): string {
   return shell('運営: パスワードリセット', `<h2>運営: パスワードリセット</h2>
@@ -180,6 +249,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method === 'GET') {
     if (req.query.forgot) return send(res, 200, forgotPage());
     if (req.query.admin) return send(res, 200, adminPage());
+    if (typeof req.query.reset === 'string') {
+      const officeId = await verifyResetToken(req.query.reset, Date.now());
+      return send(res, officeId ? 200 : 400, officeId ? resetPwPage(req.query.reset) : invalidResetPage());
+    }
     const sid = verify(parseCookies(req)[COOKIE]);
     if (req.query.settings) {
       if (!sid) {
@@ -221,7 +294,38 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return send(res, 200, changePwPage({ info: 'パスワードを変更しました。' }));
   }
 
-  // ── 運営によるパスワードリセット（ADMIN_KEY 必須） ──
+  // ── パスワード再設定: リンク要求（登録メールへ送信） ──
+  if (action === 'forgot') {
+    // 列挙攻撃を防ぐため、結果に関わらず同じ文言を返す
+    const generic = 'ご登録があれば、再設定リンクをメールでお送りしました。メールをご確認ください（30分有効）。';
+    if (email) {
+      const { data } = await supabase.from('offices').select('id, email, password_hash, status').ilike('email', email).limit(1);
+      const office = data && data.length ? data[0] : null;
+      if (office && office.status === 'active') {
+        const token = makeResetToken(office.id, office.password_hash, Date.now());
+        const link = `${APP_ORIGIN}/api/office?reset=${encodeURIComponent(token)}`;
+        const sent = await sendResetEmail(office.email, link);
+        if (!sent && !RESEND_API_KEY) {
+          // メール基盤未設定: 運営が気づけるようログ。利用者には汎用文言。
+          console.warn('RESEND_API_KEY 未設定のため再設定メールを送信できません。reset link=', link);
+        }
+      }
+    }
+    return send(res, 200, forgotPage({ info: generic }));
+  }
+
+  // ── パスワード再設定: 新パスワード確定（トークン検証） ──
+  if (action === 'resetpw') {
+    const token = String(b.token ?? '');
+    const newpw = String(b.newpw ?? '');
+    const officeId = await verifyResetToken(token, Date.now());
+    if (!officeId) return send(res, 400, invalidResetPage());
+    if (newpw.length < 8) return send(res, 400, resetPwPage(token, { error: 'パスワードは8文字以上にしてください。' }));
+    await supabase.from('offices').update({ password_hash: hashPassword(newpw) }).eq('id', officeId);
+    return send(res, 200, page({ mode: 'login', info: 'パスワードを再設定しました。新しいパスワードでログインしてください。' }));
+  }
+
+  // ── 運営によるパスワードリセット（ADMIN_KEY 必須・メール未設定時のフォールバック） ──
   if (action === 'adminreset') {
     if (!ADMIN_KEY || b.adminkey !== ADMIN_KEY) {
       return send(res, 403, adminPage({ error: '管理キーが正しくありません。' }));
