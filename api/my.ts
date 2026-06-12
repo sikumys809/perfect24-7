@@ -16,6 +16,7 @@ const SUPABASE_KEY = process.env.SUPABASE_KEY ?? '';
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
 const COOKIE = 'p247_client';
+const ENV_LINE_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN ?? '';
 
 const DOC_LABEL: Record<string, string> = {
   receipt: '領収書', invoice: '請求書', bankbook: '通帳', credit_card: 'カード明細',
@@ -80,6 +81,59 @@ function parseCookies(req: VercelRequest): Record<string, string> {
     if (idx > 0) out[part.slice(0, idx).trim()] = decodeURIComponent(part.slice(idx + 1).trim());
   }
   return out;
+}
+
+// ───────── OTP（ワンタイムパス）ログイン ─────────
+function genOtp(): string {
+  return String(crypto.randomInt(0, 1000000)).padStart(6, '0');
+}
+// 「コード入力 → OTP入力」間の受け渡し用 短命トークン（client_id + 期限を署名）
+function otpToken(clientId: string): string {
+  const payload = `${clientId}.${Date.now() + 10 * 60 * 1000}`;
+  const sig = crypto.createHmac('sha256', SUPABASE_KEY).update('otp:' + payload).digest('base64url');
+  return `${payload}.${sig}`;
+}
+function readOtpToken(token: unknown): string | null {
+  const parts = String(token ?? '').split('.');
+  if (parts.length !== 3) return null;
+  const [clientId, exp, sig] = parts;
+  const expect = crypto.createHmac('sha256', SUPABASE_KEY).update('otp:' + clientId + '.' + exp).digest('base64url');
+  const a = Buffer.from(sig);
+  const b = Buffer.from(expect);
+  if (!(a.length === b.length && crypto.timingSafeEqual(a, b))) return null;
+  if (Number(exp) < Date.now()) return null;
+  return clientId;
+}
+// OTP を顧問先の LINE にプッシュ（事務所トークン→env フォールバック）
+async function pushLineOtp(client: any, otp: string): Promise<boolean> {
+  let token = ENV_LINE_TOKEN;
+  if (client.office_id) {
+    const { data: off } = await supabase
+      .from('offices')
+      .select('line_channel_access_token')
+      .eq('id', client.office_id)
+      .limit(1);
+    if (off && off.length && off[0].line_channel_access_token) token = off[0].line_channel_access_token;
+  }
+  if (!token || !client.linked_line_user_id) return false;
+  try {
+    const r = await fetch('https://api.line.me/v2/bot/message/push', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({
+        to: client.linked_line_user_id,
+        messages: [
+          {
+            type: 'text',
+            text: `【ログイン用ワンタイムパスワード】\n${otp}\n\n5分以内に画面へ入力してください。\nお心当たりがない場合はこのメッセージを無視してください。`,
+          },
+        ],
+      }),
+    });
+    return r.ok;
+  } catch {
+    return false;
+  }
 }
 
 const PAGE_HEAD = `<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
@@ -265,12 +319,34 @@ function loginPage(error?: string): string {
   return `<!doctype html><html lang="ja"><head>${PAGE_HEAD}<title>顧問先ログイン｜パーフェクト24/7</title></head><body>
 <div class="login">
   <h2>書類かんたん確認</h2>
-  <p>事務所からお伝えした<b>登録コード</b>を入力してください。送った領収書・請求書をいつでも確認できます。</p>
+  <p>事務所からお伝えした<b>登録コード</b>を入力してください。<br>確認のため、お使いの<b>LINEにワンタイムパスワード</b>をお送りします。</p>
   <form method="post" action="/api/my">
-    <input type="hidden" name="action" value="login">
-    <input name="code" placeholder="登録コード" autocomplete="one-time-code" autocapitalize="characters" required>
+    <input type="hidden" name="action" value="requestotp">
+    <input name="code" placeholder="登録コード" autocomplete="off" autocapitalize="characters" required>
+    <button type="submit">次へ（パスワードを送る）</button>
+    ${error ? `<div class="err">${esc(error)}</div>` : ''}
+  </form>
+</div>
+</body></html>`;
+}
+
+// ステップ2: LINEに届いたOTPを入力
+function renderOtpPage(token: string, error?: string): string {
+  return `<!doctype html><html lang="ja"><head>${PAGE_HEAD}<title>ワンタイムパスワード｜パーフェクト24/7</title></head><body>
+<div class="login">
+  <h2>ワンタイムパスワード</h2>
+  <p>あなたの<b>LINE</b>に6桁のパスワードをお送りしました。<br>5分以内に入力してください。</p>
+  <form method="post" action="/api/my">
+    <input type="hidden" name="action" value="verifyotp">
+    <input type="hidden" name="token" value="${esc(token)}">
+    <input name="otp" placeholder="6桁の数字" inputmode="numeric" autocomplete="one-time-code" maxlength="6" required>
     <button type="submit">ログイン</button>
     ${error ? `<div class="err">${esc(error)}</div>` : ''}
+  </form>
+  <form method="post" action="/api/my" style="margin-top:10px;text-align:center">
+    <input type="hidden" name="action" value="resendotp">
+    <input type="hidden" name="token" value="${esc(token)}">
+    <button type="submit" style="background:none;color:#64748b;border:none;font-size:.85rem;text-decoration:underline;cursor:pointer">パスワードを再送する</button>
   </form>
 </div>
 </body></html>`;
@@ -598,20 +674,61 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return res.status(200).send(loginPage());
   }
 
-  // ログイン（登録コード）
-  if (req.method === 'POST' && req.body?.action === 'login') {
-    const code = normCode(req.body?.code);
+  // ① 登録コード入力 / 再送 → そのLINEにOTPをプッシュ
+  if (req.method === 'POST' && (req.body?.action === 'requestotp' || req.body?.action === 'resendotp')) {
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
-    if (!code) return res.status(400).send(loginPage('登録コードを入力してください。'));
-    const { data } = await supabase
-      .from('clients')
-      .select('id')
-      .eq('registration_code', code)
-      .limit(1);
-    const client = data && data.length ? data[0] : null;
+    const sel = 'id, client_code, official_name, office_id, linked_line_user_id';
+    let client: any = null;
+    if (req.body.action === 'resendotp') {
+      const cid = readOtpToken(req.body?.token);
+      if (cid) {
+        const { data } = await supabase.from('clients').select(sel).eq('id', cid).limit(1);
+        client = data && data.length ? data[0] : null;
+      }
+    } else {
+      const code = normCode(req.body?.code);
+      if (!code) return res.status(400).send(loginPage('登録コードを入力してください。'));
+      const { data } = await supabase.from('clients').select(sel).eq('registration_code', code).limit(1);
+      client = data && data.length ? data[0] : null;
+    }
     if (!client) return res.status(401).send(loginPage('登録コードが正しくありません。事務所にご確認ください。'));
-    res.setHeader('Set-Cookie', `${COOKIE}=${encodeURIComponent(sign(client.id))}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=2592000`);
+    if (!client.linked_line_user_id) {
+      return res.status(400).send(loginPage('このコードにLINE連携がありません。事務所にご連絡ください。'));
+    }
+    const otp = genOtp();
+    await supabase
+      .from('clients')
+      .update({ otp_code: otp, otp_expires: new Date(Date.now() + 5 * 60 * 1000).toISOString(), otp_attempts: 0 })
+      .eq('id', client.id);
+    const ok = await pushLineOtp(client, otp);
+    if (!ok) return res.status(500).send(loginPage('パスワードの送信に失敗しました。時間をおいて再度お試しください。'));
+    return res.status(200).send(renderOtpPage(otpToken(client.id)));
+  }
+
+  // ② OTP照合 → ログイン（Cookie発行）
+  if (req.method === 'POST' && req.body?.action === 'verifyotp') {
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
     res.setHeader('Cache-Control', 'no-store');
+    const cid = readOtpToken(req.body?.token);
+    if (!cid) return res.status(401).send(loginPage('有効期限が切れました。もう一度コードを入力してください。'));
+    const { data } = await supabase.from('clients').select('id, otp_code, otp_expires, otp_attempts').eq('id', cid).limit(1);
+    const c = data && data.length ? data[0] : null;
+    if (!c || !c.otp_code) return res.status(401).send(loginPage('もう一度ログインしてください。'));
+    if ((c.otp_attempts ?? 0) >= 5) {
+      await supabase.from('clients').update({ otp_code: null }).eq('id', cid);
+      return res.status(401).send(loginPage('試行回数の上限に達しました。もう一度コードを入力してください。'));
+    }
+    if (!c.otp_expires || new Date(c.otp_expires).getTime() < Date.now()) {
+      return res.status(401).send(renderOtpPage(String(req.body.token), 'パスワードの有効期限が切れました。再送してください。'));
+    }
+    const entered = String(req.body?.otp ?? '').replace(/[^0-9]/g, '');
+    if (entered !== c.otp_code) {
+      await supabase.from('clients').update({ otp_attempts: (c.otp_attempts ?? 0) + 1 }).eq('id', cid);
+      return res.status(401).send(renderOtpPage(String(req.body.token), 'パスワードが違います。'));
+    }
+    // 成功 → OTP無効化＋セッションCookie
+    await supabase.from('clients').update({ otp_code: null, otp_expires: null, otp_attempts: 0 }).eq('id', cid);
+    res.setHeader('Set-Cookie', `${COOKIE}=${encodeURIComponent(sign(cid))}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=2592000`);
     return res.redirect(303, '/api/my');
   }
 
