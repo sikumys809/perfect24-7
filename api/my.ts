@@ -534,6 +534,14 @@ function renderEditPage(rec: Row, f: Record<string, string>): string {
     <p class="note">※ 保存すると事務所に「顧問先修正」として伝わります。原本（写真）は変わりません。</p>
   </form>
 </div>
+<script>(function(){
+  var fm=document.querySelector('.editform');
+  if(!fm)return;
+  fm.addEventListener('submit',function(){
+    var b=fm.querySelector('button[type=submit]');
+    if(b){b.disabled=true;b.textContent='保存中…';b.style.opacity='.7';}
+  });
+})();</script>
 </body></html>`;
 }
 
@@ -582,16 +590,18 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const tax = num(req.body?.tax_amount);
     const net = total != null && tax != null ? total - tax : total;
     const issued = typeof req.body?.issued_date === 'string' && req.body.issued_date ? req.body.issued_date : null;
-    await supabase
-      .from('receipts')
-      .update({ total_amount: total, tax_amount: tax, amount: net, issued_date: issued, description: req.body?.note || null })
-      .eq('id', id);
-    await setField(id, 'counterparty', String(req.body?.counterparty ?? '').trim() || null);
-    await setField(id, 'note', String(req.body?.note ?? '').trim() || null);
-    await setField(id, 'tax_amount', tax != null ? String(tax) : null);
-    // 「顧問先修正」マーク（事務所側で見える）
+    // 「顧問先修正」マーク（事務所側で見える）。書き込みは並列で速く
     const stamp = new Date(Date.now() + 9 * 3600 * 1000).toISOString().replace('T', ' ').slice(0, 16);
-    await setField(id, 'client_edited', stamp);
+    await Promise.all([
+      supabase
+        .from('receipts')
+        .update({ total_amount: total, tax_amount: tax, amount: net, issued_date: issued, description: req.body?.note || null })
+        .eq('id', id),
+      setField(id, 'counterparty', String(req.body?.counterparty ?? '').trim() || null),
+      setField(id, 'note', String(req.body?.note ?? '').trim() || null),
+      setField(id, 'tax_amount', tax != null ? String(tax) : null),
+      setField(id, 'client_edited', stamp),
+    ]);
     return res.redirect(303, '/api/my');
   }
 
