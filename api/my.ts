@@ -231,6 +231,14 @@ const PAGE_HEAD = `<meta charset="utf-8"><meta name="viewport" content="width=de
   .uptoast { position:fixed; left:50%; bottom:20px; transform:translateX(-50%); background:#0f172a; color:#fff; padding:12px 18px; border-radius:12px; font-size:.85rem; max-width:90%; box-shadow:0 6px 20px rgba(0,0,0,.28); z-index:50; white-space:pre-line; display:none; text-align:center; }
   .uptoast.show { display:block; }
   .uptoast.err { background:#b91c1c; }
+  /* PC幅: 一覧ダッシュのみ2カラム（左=経営パネル固定／右=アップロード+書類）。スマホは縦積みのまま */
+  .layout { display:block; }
+  @media (min-width:880px){
+    .wrap.wide { max-width:1080px; }
+    .wrap.wide .layout { display:grid; grid-template-columns:340px 1fr; gap:22px; align-items:start; }
+    .wrap.wide .col-side { position:sticky; top:64px; }
+    .wrap.wide .mgmt { margin-bottom:0; }
+  }
 </style>`;
 
 // アップローダー（ハイブリッド: 大きなドロップゾーン＋カテゴリタイル。種別は裏でAIが自動判別）。
@@ -550,11 +558,15 @@ async function renderDashboard(clientId: string, fType: string): Promise<string>
   <a class="logout" href="/api/my?info=1">基本情報</a>
   <a class="logout" href="/api/my?logout=1">ログアウト</a>
 </header>
-<div class="wrap">
-  ${mgmt}
-  ${UPLOADER}
-  <div class="filterbar">${tabs}</div>
-  ${cards}
+<div class="wrap wide">
+  <div class="layout">
+    <aside class="col-side">${mgmt}</aside>
+    <div class="col-main">
+      ${UPLOADER}
+      <div class="filterbar">${tabs}</div>
+      ${cards}
+    </div>
+  </div>
 </div>
 </body></html>`;
 }
