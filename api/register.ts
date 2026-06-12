@@ -10,7 +10,7 @@ export const config = { maxDuration: 20 };
 const SUPABASE_URL = (process.env.SUPABASE_URL ?? '').replace(/\/rest\/v1\/?$/, '');
 const SUPABASE_KEY = process.env.SUPABASE_KEY ?? '';
 const ENV_LINE_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN ?? '';
-const LIFF_ID = process.env.LIFF_ID || '2010381130-ZERK9yVI';
+const LIFF_ID = process.env.LIFF_ID || '2010381453-fQ4q2Hlc';
 const LOGIN_CHANNEL_ID = LIFF_ID.split('-')[0]; // ID トークン検証の client_id
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 

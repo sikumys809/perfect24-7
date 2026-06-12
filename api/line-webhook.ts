@@ -162,7 +162,7 @@ async function replyLineMessage(accessToken: string, replyToken: string, text: s
 }
 
 // 友達追加・未登録時：LIFF登録フォームへのボタンを返す
-const LIFF_ID = process.env.LIFF_ID || '2010381130-ZERK9yVI';
+const LIFF_ID = process.env.LIFF_ID || '2010381453-fQ4q2Hlc';
 async function replyRegisterPrompt(accessToken: string, replyToken: string) {
   await fetch('https://api.line.me/v2/bot/message/reply', {
     method: 'POST',
