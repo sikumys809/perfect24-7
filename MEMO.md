@@ -188,5 +188,12 @@ Generated on 2026-06-10
 
 ## 重要：共有import問題の確証（今回プローブで確定）
 - `lib/` （api/の外）からの import も **FUNCTION_INVOCATION_FAILED** で失敗を実機確認。この構成では共有モジュール化は不可。**会計/抽出ロジックは各エンドポイントにインライン複製が唯一の方法**。将来直すならビルド方式（bundling）の見直しが要る。
+- ※npm パッケージ（@supabase/supabase-js, @anthropic-ai/sdk, **pdf-lib**）は問題なくバンドルされる。落ちるのは「自前の相対 import」だけ。
+
+## 大きいファイル対応（2026-06-12 続き・本番検証済み）
+- **① 直アップロード（転送3MB→20MB）**: `/api/upload-url` が署名付きアップロードURLを発行→ブラウザがSupabase Storageへ**直接PUT**（Vercelボディ4.5MB上限を回避）→`/api/upload`にpath+署名を渡す。pathはclientIdとHMAC署名し他人ファイル処理を防止。画像は送信前にブラウザでcanvas縮小(2200px/JPEG0.85)＝Claude5MB制限・速度・コスト対策。サーバ側20MBガード。Function数=10。
+- **②-2 巨大PDF（ページ分割→並列抽出→マージ）**: 5ページ超のPDFは3ページずつ分割し各チャンクを並列Claude抽出、最多の document_type で配列(transactions/lines/receipts)を連結し1書類に統合。時間(60s)＋出力トークン(途中切れ)の両壁を回避。`extractDocumentMerged` を line-webhook/upload 両方にインライン、外側呼び出しのみ差し替え（画像・4ページ以下・分割失敗は従来どおり1回）。同時実行5。
+  - **残課題（②-3）**: 40ページ超など極端に大きいPDFは並列でも60sを超え得る（真の非同期化=Cron/キューが必要）。通帳明細・賃金台帳・レシート束の現実的サイズはカバー済み。
+  - 注意: 多ページに渡る「1枚の請求書」を>4ページで分割すると各チャンクが別レコード化し得る（稀）。閾値5ページで通常文書は保護。
 
 *Generated on 2026-06-12*
