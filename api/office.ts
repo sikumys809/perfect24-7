@@ -15,6 +15,7 @@ const SUPABASE_KEY = process.env.SUPABASE_KEY ?? '';
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
 const COOKIE = 'p247_office';
+const ADMIN_KEY = process.env.ADMIN_KEY ?? ''; // 運営によるパスワードリセット用
 
 function esc(s: unknown): string {
   return String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c] as string);
@@ -110,11 +111,57 @@ ${
     <button type="submit">ログイン</button>
     <div class="note">初めてのログインでは、入力したパスワードが設定されます。</div>
   </form>
-  <div class="switch">事務所の新規登録は <a href="/api/office?signup=1">こちら</a></div>`
+  <div class="switch">事務所の新規登録は <a href="/api/office?signup=1">こちら</a></div>
+  <div class="switch"><a href="/api/office?forgot=1" style="color:#94a3b8;font-weight:400">パスワードをお忘れの方</a></div>`
 }
 ${opts.error ? `<div class="err">${esc(opts.error)}</div>` : ''}
 ${opts.info ? `<div class="info">${esc(opts.info)}</div>` : ''}
 </div></body></html>`;
+}
+
+// 小さなフォーム用の共通シェル
+function shell(title: string, inner: string): string {
+  return `<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>${esc(title)}｜パーフェクト24/7</title>
+<style>
+  body{margin:0;background:#0f172a;font-family:-apple-system,BlinkMacSystemFont,"Hiragino Kaku Gothic ProN","Noto Sans JP",sans-serif;}
+  .top{padding:26px 0 6px;text-align:center;}
+  .logo{font-weight:800;font-size:1.3rem;background:linear-gradient(90deg,#38bdf8,#818cf8);-webkit-background-clip:text;background-clip:text;color:transparent;} .logo .mk{-webkit-text-fill-color:initial;}
+  .card{max-width:400px;margin:16px auto;background:#fff;border-radius:16px;padding:24px;}
+  h2{margin:0 0 6px;font-size:1.1rem;} label{display:block;font-size:.82rem;font-weight:700;color:#334155;margin:12px 0 4px;}
+  input{width:100%;font-size:1rem;padding:11px;border:1px solid #cbd5e1;border-radius:10px;box-sizing:border-box;}
+  button{width:100%;margin-top:18px;font-size:1.02rem;font-weight:700;padding:13px;border:none;border-radius:11px;background:#2563eb;color:#fff;cursor:pointer;}
+  .err{margin-top:12px;color:#dc2626;font-size:.85rem;text-align:center;} .info{margin-top:12px;color:#047857;font-size:.85rem;text-align:center;background:#ecfdf5;border:1px solid #a7f3d0;border-radius:10px;padding:10px;}
+  .note{font-size:.82rem;color:#64748b;margin-top:10px;line-height:1.7;} a{color:#2563eb;text-decoration:none;font-weight:700;} .center{text-align:center;margin-top:14px;}
+</style></head><body>
+<div class="top"><div class="logo"><span class="mk">⚡</span>パーフェクト24/7</div></div>
+<div class="card">${inner}</div></body></html>`;
+}
+function changePwPage(o: { error?: string; info?: string } = {}): string {
+  return shell('パスワード変更', `<h2>パスワード変更</h2>
+  <form method="post" action="/api/office">
+    <input type="hidden" name="action" value="changepw">
+    <label>現在のパスワード</label><input name="current" type="password" required>
+    <label>新しいパスワード（8文字以上）</label><input name="newpw" type="password" minlength="8" required>
+    <button type="submit">変更する</button>
+  </form>
+  ${o.error ? `<div class="err">${esc(o.error)}</div>` : ''}${o.info ? `<div class="info">${esc(o.info)}</div>` : ''}
+  <div class="center"><a href="/api/dashboard">← ダッシュボードへ</a></div>`);
+}
+function forgotPage(): string {
+  return shell('パスワードをお忘れの方', `<h2>パスワードをお忘れの方</h2>
+  <p class="note">セキュリティのため、パスワードはご自身でしか再設定できません。ログインできない場合は、お手数ですが<b>運営（パーフェクト24/7）までご連絡ください</b>。本人確認のうえ、リセットいたします。<br>リセット後は、ログイン画面で新しいパスワードを入力すると、それが新しいパスワードとして設定されます。</p>
+  <div class="center"><a href="/api/office">← ログインへ戻る</a></div>`);
+}
+function adminPage(o: { error?: string; info?: string } = {}): string {
+  return shell('運営: パスワードリセット', `<h2>運営: パスワードリセット</h2>
+  <p class="note">対象事務所のパスワードを無効化します。対象事務所は次回ログイン時に入力したパスワードが新しいパスワードとして設定されます。</p>
+  <form method="post" action="/api/office">
+    <input type="hidden" name="action" value="adminreset">
+    <label>対象事務所のメールアドレス</label><input name="email" type="email" autocapitalize="off" required>
+    <label>管理キー（ADMIN_KEY）</label><input name="adminkey" type="password" required>
+    <button type="submit">リセットする</button>
+  </form>
+  ${o.error ? `<div class="err">${esc(o.error)}</div>` : ''}${o.info ? `<div class="info">${esc(o.info)}</div>` : ''}`);
 }
 
 function send(res: VercelResponse, status: number, html: string) {
@@ -131,8 +178,18 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   }
 
   if (req.method === 'GET') {
+    if (req.query.forgot) return send(res, 200, forgotPage());
+    if (req.query.admin) return send(res, 200, adminPage());
+    const sid = verify(parseCookies(req)[COOKIE]);
+    if (req.query.settings) {
+      if (!sid) {
+        res.setHeader('Location', '/api/office');
+        return res.status(302).end();
+      }
+      return send(res, 200, changePwPage());
+    }
     // 既にログイン済みならダッシュボードへ
-    if (verify(parseCookies(req)[COOKIE])) {
+    if (sid) {
       res.setHeader('Location', '/api/dashboard');
       return res.status(302).end();
     }
@@ -145,6 +202,38 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   const action = b.action;
   const email = String(b.email ?? '').trim().toLowerCase();
   const password = String(b.password ?? '');
+
+  // ── パスワード変更（ログイン中・現パスワード確認） ──
+  if (action === 'changepw') {
+    const sid = verify(parseCookies(req)[COOKIE]);
+    if (!sid) {
+      res.setHeader('Location', '/api/office');
+      return res.status(302).end();
+    }
+    const current = String(b.current ?? '');
+    const newpw = String(b.newpw ?? '');
+    const { data } = await supabase.from('offices').select('password_hash').eq('id', sid).single();
+    if (!data || !verifyPassword(current, data.password_hash)) {
+      return send(res, 401, changePwPage({ error: '現在のパスワードが正しくありません。' }));
+    }
+    if (newpw.length < 8) return send(res, 400, changePwPage({ error: '新しいパスワードは8文字以上にしてください。' }));
+    await supabase.from('offices').update({ password_hash: hashPassword(newpw) }).eq('id', sid);
+    return send(res, 200, changePwPage({ info: 'パスワードを変更しました。' }));
+  }
+
+  // ── 運営によるパスワードリセット（ADMIN_KEY 必須） ──
+  if (action === 'adminreset') {
+    if (!ADMIN_KEY || b.adminkey !== ADMIN_KEY) {
+      return send(res, 403, adminPage({ error: '管理キーが正しくありません。' }));
+    }
+    if (!email) return send(res, 400, adminPage({ error: 'メールアドレスを入力してください。' }));
+    const { data } = await supabase.from('offices').update({ password_hash: null }).ilike('email', email).select('id');
+    return send(res, 200, adminPage({
+      info: data && data.length
+        ? '無効化しました。対象事務所は次回ログイン時に新しいパスワードを設定できます。'
+        : '該当する事務所が見つかりませんでした。',
+    }));
+  }
 
   // ── 新規登録（pending で作成） ──
   if (action === 'signup') {

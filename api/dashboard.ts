@@ -775,7 +775,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     <a href="${reportHref('trial')}">📊 試算表</a>
     <a href="${reportHref('ledger')}">📒 総勘定元帳</a>
     <a href="/api/dashboard?view=clients${key ? `&key=${encodeURIComponent(key)}` : ''}">👤 顧問先情報</a>
-    ${officeId ? `<a href="/api/office?logout=1">ログアウト</a>` : ''}
+    ${officeId ? `<a href="/api/office?settings=1">🔑 パスワード変更</a><a href="/api/office?logout=1">ログアウト</a>` : ''}
   </nav>
   <span class="live">● 20秒ごとに自動更新</span>
 </header>
