@@ -147,7 +147,80 @@ const PAGE_HEAD = `<meta charset="utf-8"><meta name="viewport" content="width=de
   .trow .tp.neg { color:#dc2626; }
   .subtally { margin-top:10px; font-size:.78rem; color:var(--muted); text-align:right; }
   .muted { color:var(--muted); font-size:.82rem; }
+  .uploader { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:14px; margin-bottom:14px; }
+  .dropzone { border:2px dashed #cbd5e1; border-radius:12px; padding:22px 14px; text-align:center; color:var(--muted); cursor:pointer; transition:.15s; }
+  .dropzone.drag { border-color:#2563eb; background:#eff6ff; color:#2563eb; }
+  .dropzone .big { font-size:1.6rem; line-height:1; }
+  .dropzone .t { font-weight:800; color:var(--text); margin-top:6px; font-size:1rem; }
+  .dropzone .s { font-size:.8rem; margin-top:4px; line-height:1.6; }
+  .uphint { font-size:.76rem; color:var(--muted); margin:12px 2px 6px; }
+  .tiles { display:grid; grid-template-columns:repeat(auto-fill,minmax(98px,1fr)); gap:8px; }
+  .tile { border:1px solid var(--line); border-radius:12px; padding:10px 6px; text-align:center; cursor:pointer; background:#f8fafc; transition:.12s; }
+  .tile:hover, .tile:active { border-color:#2563eb; background:#eff6ff; }
+  .tile .ic { font-size:1.35rem; line-height:1; }
+  .tile .nm { font-size:.76rem; font-weight:700; margin-top:4px; }
+  .tile .ds { font-size:.66rem; color:var(--muted); margin-top:2px; line-height:1.3; }
+  .upbusy { opacity:.55; pointer-events:none; }
+  .uptoast { position:fixed; left:50%; bottom:20px; transform:translateX(-50%); background:#0f172a; color:#fff; padding:12px 18px; border-radius:12px; font-size:.85rem; max-width:90%; box-shadow:0 6px 20px rgba(0,0,0,.28); z-index:50; white-space:pre-line; display:none; text-align:center; }
+  .uptoast.show { display:block; }
+  .uptoast.err { background:#b91c1c; }
 </style>`;
+
+// アップローダー（ハイブリッド: 大きなドロップゾーン＋カテゴリタイル。種別は裏でAIが自動判別）。
+const UPLOAD_TILES: [string, string, string][] = [
+  ['🧾', '領収書', 'レシート'],
+  ['📄', '請求書', '受取/発行'],
+  ['🏦', '通帳', '預金の記帳'],
+  ['💳', 'カード明細', 'クレカ利用'],
+  ['👥', '給与明細', '明細/賃金台帳'],
+  ['🧾', '納付書', '税金/社保'],
+  ['🏢', '固定資産', '車/機械/PC等'],
+  ['🛒', 'EC入金', 'Amazon/楽天等'],
+  ['💴', '小口現金', '出納帳'],
+  ['🧮', '棚卸表', '期末在庫'],
+  ['📉', '返済予定表', '借入金'],
+  ['📑', '残高証明', '銀行'],
+];
+const UPLOADER = `
+  <div class="uploader" id="up">
+    <div class="dropzone" id="dz">
+      <div class="big">⬆</div>
+      <div class="t">書類をアップロード</div>
+      <div class="s">タップして写真/PDFを選択（PCはドラッグ＆ドロップ）<br>種類はAIが自動で判別します</div>
+    </div>
+    <div class="uphint">迷ったら↓から（タップでもアップできます）</div>
+    <div class="tiles">${UPLOAD_TILES.map(
+      ([ic, nm, ds]) => `<div class="tile"><div class="ic">${ic}</div><div class="nm">${nm}</div><div class="ds">${ds}</div></div>`,
+    ).join('')}</div>
+    <input type="file" id="upfile" accept="image/*,application/pdf" style="display:none">
+  </div>
+  <div class="uptoast" id="uptoast"></div>
+  <script>(function(){
+    var dz=document.getElementById('dz'),inp=document.getElementById('upfile'),up=document.getElementById('up'),toast=document.getElementById('uptoast');
+    function show(m,e){toast.textContent=m;toast.className='uptoast show'+(e?' err':'');}
+    function hide(){toast.className='uptoast';}
+    function pick(){inp.click();}
+    dz.addEventListener('click',pick);
+    Array.prototype.forEach.call(document.querySelectorAll('.tile'),function(t){t.addEventListener('click',pick);});
+    ['dragover','dragenter'].forEach(function(e){dz.addEventListener(e,function(ev){ev.preventDefault();dz.classList.add('drag');});});
+    ['dragleave','dragend','drop'].forEach(function(e){dz.addEventListener(e,function(ev){ev.preventDefault();dz.classList.remove('drag');});});
+    dz.addEventListener('drop',function(ev){var f=ev.dataTransfer&&ev.dataTransfer.files&&ev.dataTransfer.files[0];if(f)send(f);});
+    inp.addEventListener('change',function(){if(inp.files&&inp.files[0])send(inp.files[0]);inp.value='';});
+    function send(file){
+      if(file.size>3*1024*1024){show('ファイルが大きいようです（3MBまで）。大きい場合はLINEで送ってください。',true);setTimeout(hide,5000);return;}
+      show('アップロード中…\\n「'+file.name+'」');up.classList.add('upbusy');
+      var fr=new FileReader();
+      fr.onload=function(){
+        var b64=String(fr.result).split(',')[1]||'';
+        fetch('/api/upload',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({filename:file.name,contentType:file.type||'application/octet-stream',dataBase64:b64})})
+        .then(function(r){return r.json().catch(function(){return {ok:false,message:'通信エラー'};});})
+        .then(function(j){up.classList.remove('upbusy');show((j.ok?'✓ ':'⚠️ ')+(j.message||''),!j.ok);if(j.ok){setTimeout(function(){location.reload();},1600);}else{setTimeout(hide,5000);}})
+        .catch(function(){up.classList.remove('upbusy');show('アップロードに失敗しました。',true);setTimeout(hide,5000);});
+      };
+      fr.onerror=function(){up.classList.remove('upbusy');show('ファイルの読み込みに失敗しました。',true);setTimeout(hide,5000);};
+      fr.readAsDataURL(file);
+    }
+  })();</script>`;
 
 function loginPage(error?: string): string {
   return `<!doctype html><html lang="ja"><head>${PAGE_HEAD}<title>顧問先ログイン｜パーフェクト24/7</title></head><body>
@@ -358,6 +431,7 @@ async function renderDashboard(clientId: string, fType: string): Promise<string>
 </header>
 <div class="wrap">
   ${mgmt}
+  ${UPLOADER}
   <div class="filterbar">${tabs}</div>
   ${cards}
 </div>

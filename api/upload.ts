@@ -1,0 +1,1185 @@
+import type { VercelRequest, VercelResponse } from '@vercel/node';
+import crypto from 'node:crypto';
+import { createClient } from '@supabase/supabase-js';
+import Anthropic from '@anthropic-ai/sdk';
+
+// 顧問先ダッシュ(/api/my)からのファイルアップロード受け口。
+// 重要: この Vercel 構成では api/ 内の相互 import が解決されないため、抽出・保存パイプラインを
+// line-webhook.ts からインライン複製している（共有モジュール化は不可。変更時は両方を直すこと）。
+// 認証は /api/my と同じ署名付き Cookie。リクエストは JSON { filename, contentType, dataBase64 }。
+export const config = { maxDuration: 60 };
+
+const SUPABASE_URL = (process.env.SUPABASE_URL ?? '').replace(/\/rest\/v1\/?$/, '');
+const SUPABASE_KEY = process.env.SUPABASE_KEY ?? '';
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY ?? '';
+const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+const anthropic = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
+const COOKIE = 'p247_client';
+
+// ════════════ ここから line-webhook.ts と同一のインライン・パイプライン ════════════
+
+// 勘定科目コードは 011_account_titles.sql と一致。
+type Account = {
+  code: string;
+  name: string;
+  category: 'asset' | 'liability' | 'equity' | 'revenue' | 'expense';
+  statement: 'BS' | 'PL';
+  normal_balance: 'debit' | 'credit';
+  sort_order: number | null;
+};
+const ACC = {
+  cash: '1010', bank: '1020', receivable: '1040', payable: '2020',
+  deposit_received: '2040', sales: '4010', salary: '6020',
+  travel: '6070', entertainment: '6080', meeting: '6090', communication: '6100',
+  supplies: '6110', office_supplies: '6120', utilities: '6130', rent: '6140',
+  fee: '6160', tax_public: '6170', ad: '6190', repair: '6200', insurance: '6210',
+  books: '6220', freight: '6240', vehicle: '6250',
+};
+const ASSET_CATEGORY_CODE: [RegExp, string][] = [
+  [/建物附属|附属設備/, '1520'], [/建物/, '1510'], [/機械|装置/, '1530'],
+  [/車両|車輌|運搬具/, '1540'], [/ソフト|software/i, '1560'], [/工具|器具|備品/, '1550'],
+];
+const TAX_KIND_CODE: [RegExp, string][] = [
+  [/源泉|住民/, ACC.deposit_received],
+  [/法人税|地方法人|事業税|都道府県民|市町村民/, '9010'],
+  [/社会保険|健康保険|厚生年金|労働保険|雇用保険/, '6040'],
+];
+const EXPENSE_KEYWORDS: [RegExp, string][] = [
+  [/タクシー|ＪＲ|JR|新幹線|鉄道|電車|地下鉄|バス|航空|ANA|JAL|高速|ETC|駐車|パーキング|Suica|PASMO|ｓｕｉｃａ/i, ACC.travel],
+  [/ガソリン|給油|エネオス|ENEOS|出光|コスモ石油|シェル/i, ACC.vehicle],
+  [/ドコモ|ＮＴＴ|NTT|ソフトバンク|softbank|au|KDDI|携帯|電話|インターネット|プロバイダ|wifi|Wi-Fi/i, ACC.communication],
+  [/電力|電気|東京電力|関西電力|中部電力|ガス|都市ガス|水道/i, ACC.utilities],
+  [/家賃|賃料|テナント|管理費|共益費|月極/i, ACC.rent],
+  [/ヤマト|佐川|日本郵便|ゆうパック|郵便|宅配|運送|配送/i, ACC.freight],
+  [/書店|書房|新聞|出版|kindle|Kindle/i, ACC.books],
+  [/広告|チラシ|印刷|Google\s?Ads|Facebook|Meta|リスティング/i, ACC.ad],
+  [/保険/i, ACC.insurance],
+  [/修理|修繕|メンテナンス/i, ACC.repair],
+  [/振込手数料|支払手数料|手数料|決済手数料/i, ACC.fee],
+  [/スターバックス|スタバ|ドトール|喫茶|カフェ|珈琲|コーヒー/i, ACC.meeting],
+  [/居酒屋|レストラン|飲食|接待|料亭|寿司|焼肉/i, ACC.entertainment],
+  [/文具|文房具|事務用品|コクヨ|アスクル/i, ACC.office_supplies],
+];
+
+async function loadAccounts(sb: any, officeId: string | null): Promise<Account[]> {
+  const { data } = await sb
+    .from('account_titles')
+    .select('code, name, category, statement, normal_balance, sort_order, office_id, is_active')
+    .or(officeId ? `office_id.is.null,office_id.eq.${officeId}` : 'office_id.is.null')
+    .eq('is_active', true);
+  const rows = (data ?? []) as (Account & { office_id: string | null })[];
+  const byCode = new Map<string, Account>();
+  for (const r of rows) {
+    const existing = byCode.get(r.code);
+    if (!existing || r.office_id) byCode.set(r.code, r);
+  }
+  return [...byCode.values()].sort((a, b) => (a.sort_order ?? 0) - (b.sort_order ?? 0));
+}
+
+// 売上/経費の向きと書類種別から、主たる科目と相手科目を自動決定。suggested はLLM提案の科目名。
+function autoAccount(
+  ex: any,
+  docType: string | null,
+  direction: 'sales' | 'expense' | null,
+  accounts: Account[],
+  suggested?: string | null,
+): { accountCode: string | null; paymentCode: string | null; matchedSuggestion: boolean } {
+  const byName = new Map(accounts.map((a) => [a.name, a]));
+  const isInvoice = docType === 'invoice';
+  if (docType === 'fixed_asset') {
+    const cat = String(ex?.asset_category ?? '');
+    const code = ASSET_CATEGORY_CODE.find(([re]) => re.test(cat))?.[1] ?? '1550';
+    return { accountCode: code, paymentCode: ACC.payable, matchedSuggestion: false };
+  }
+  if (docType === 'tax_payment') {
+    const kind = String(ex?.tax_kind ?? '');
+    const code = TAX_KIND_CODE.find(([re]) => re.test(kind))?.[1] ?? ACC.tax_public;
+    return { accountCode: code, paymentCode: ACC.cash, matchedSuggestion: false };
+  }
+  if (docType === 'ec_payout') {
+    return { accountCode: ACC.sales, paymentCode: ACC.bank, matchedSuggestion: false };
+  }
+  if (docType === 'payslip' || docType === 'wage_ledger') {
+    return { accountCode: ACC.salary, paymentCode: ACC.cash, matchedSuggestion: false };
+  }
+  if (direction === 'sales') {
+    return { accountCode: ACC.sales, paymentCode: isInvoice ? ACC.receivable : ACC.cash, matchedSuggestion: false };
+  }
+  let accountCode: string | null = null;
+  let matched = false;
+  if (suggested && byName.has(suggested)) {
+    const a = byName.get(suggested)!;
+    if (a.category === 'expense' || a.category === 'asset') { accountCode = a.code; matched = true; }
+  }
+  if (!accountCode) {
+    const hay = `${ex?.vendor ?? ''} ${ex?.note ?? ''}`;
+    accountCode = EXPENSE_KEYWORDS.find(([re]) => re.test(hay))?.[1] ?? ACC.supplies;
+  }
+  return { accountCode, paymentCode: isInvoice ? ACC.payable : ACC.cash, matchedSuggestion: matched };
+}
+
+const EXTRACTION_PROMPT = `あなたは日本語のレシート・領収書・請求書・銀行通帳（預金通帳）を読み取る専門家です。
+1つの入力（画像またはPDF）に複数枚・複数ページが含まれることがあります（ノート台紙に複数枚貼付、PDFの複数ページ、通帳の見開きなど）。
+出力はJSONオブジェクトのみ（前後の説明文やコードフェンスは不要）。読み取れない項目は推測せず null にしてください。
+チェックボックスは実際に印（チェック）が付いているもののみ採用し、印刷された選択肢を勝手に選ばないでください。
+
+【手書きの読み取り】手書き文字は誤読しやすい（0と6、1と7、3と5、4と9、桁区切りの位置など）。
+- 自信が持てない文字・数字は当てずっぽうで埋めず、その行/項目の confidence を下げる（0.6以下）。完全に読めなければ null。
+- 数表（金額・数量・残高など）は、計算が合うか（例: 数量×単価=金額、元金+利息=返済額、前残高-元金=当残高、税抜+消費税=税込）を手がかりに桁・数字を見直す。整合しない場合は無理に確定せず confidence を下げること。
+- 金額はカンマや桁を特に慎重に。1桁の読み違いは致命的。
+
+まず書類の種類を判定してください:
+- receipt = レシート/領収書全般。店舗のレジレシート、飲食店、コンビニ、交通費（電車・タクシー・バス）、駐車場、ICカードのチャージ控え、振込金受取書、各種利用控え・支払証明など「支払った事実を示す証憑」は基本これ。
+- invoice = 請求書（これから支払う/受け取る請求。支払期日・振込先が記載されることが多い）。
+- bankbook = 銀行・信用金庫の預金通帳（取引明細が行で並ぶ）。
+- credit_card = クレジットカードのご利用明細書/利用代金明細（利用日・利用先・利用金額が行で並ぶ。「ご利用明細」「お支払金額」「カード」等）。通帳ではない。
+- tax_payment = 税金・社会保険料の納付書/領収証書/納入告知書（法人税・所得税・消費税・源泉所得税・住民税・事業税・固定資産税・自動車税・印紙税・社会保険料・労働保険料 等）。納付先が税務署/都道府県/市区町村/年金事務所/労働局など。
+- balance_certificate = 金融機関の残高証明書（決算日等の基準日の預金残高を証明。口座ごとに残高が記載）。
+- inventory = 棚卸表・在庫表（決算の期末棚卸。品名・数量・単価・金額が並ぶ。手書きも多い）。
+- loan_schedule = 借入金の返済予定表・償還予定表（返済日・返済額・元金・利息・残高が回ごとに並ぶ）。
+- payslip = 給与明細（従業員1名・1ヶ月分。基本給・手当・社会保険・源泉・差引支給額など）。
+- wage_ledger = 賃金台帳（従業員ごと・月ごとの給与を一覧した台帳。複数名/複数月が並ぶ）。
+- fixed_asset = 固定資産の取得に関する書類（車両・機械装置・器具備品・建物・ソフトウェア等、減価償却対象の資産購入。請求書/契約書/領収書の形でも、明らかに減価償却対象の資産取得ならこちら）。
+- ec_payout = ECモール・決済代行の売上/入金レポート（Amazon・楽天・BASE・Shopify・Square・PayPay・Stripe・UberEats等。総売上・手数料・入金額が記載）。
+- petty_cash = 小口現金出納帳（日付・摘要・入金(受入)・出金(支払)・残高が並ぶ現金の出納記録）。
+- other = 上記いずれにも当てはまらない場合のみ（名刺・メモ・証憑でない写真など）。判断に迷う支払系の紙は other ではなく receipt にしてください。
+
+document_type が receipt / invoice / tax_payment / balance_certificate / fixed_asset / ec_payout の場合のスキーマ（含まれる書類を1件ずつ全件。残高証明書は口座ごとに1件、ECレポートは対象期間/プラットフォームごとに1件）:
+{
+  "document_type": "receipt | invoice | tax_payment | balance_certificate | fixed_asset | ec_payout",
+  "receipts": [
+    {
+      "date": "YYYY-MM-DD 形式の発行日/納付日（和暦は西暦に変換。インボイス登録番号があるなら2023年10月以降のはず）。不明なら null",
+      "vendor": "発行元/納付先（この書類を発行した店名・会社名、納付書なら税務署/年金事務所等）。不明なら null",
+      "recipient": "宛名・請求先・宛先・納付者（この書類を受け取る/支払う側の会社/個人名。例:「○○御中」「○○様」）。無ければ null",
+      "direction": "提出者（顧問先）から見た向き。顧問先が発行した側=sales（売上）、顧問先が受け取った/支払う側=expense（経費）。納付書(tax_payment)は常に expense。判断できなければ null。下部の【提出者】の指示に従うこと",
+      "total_incl_tax": "税込合計金額＝この取引の主たる金額（納付書なら納付額。数値のみ）。不明なら null。重要: 振込手数料などの付随する少額は主金額にしない（下記の fee に入れる）",
+      "fee": "主金額とは別に併記された手数料（振込手数料・支払手数料・事務手数料など。数値のみ）。無ければ null",
+      "tax_amount": "消費税額（数値のみ）。不明なら null",
+      "tax_rate": "\\"10%\\" / \\"8%\\" / \\"mixed\\" / null のいずれか",
+      "registration_number": "インボイス登録番号（T + 13桁）。無ければ null",
+      "receipt_no": "レシート番号・取引番号・請求書番号。無ければ null",
+      "tax_kind": "tax_payment のときの税目/保険種別（例: 源泉所得税, 消費税, 法人税, 住民税, 固定資産税, 社会保険料, 労働保険料）。それ以外は null",
+      "period": "tax_payment/ec_payout のときの対象期間（例: 令和6年4月分, 2024年度, 2024-05集計）。それ以外は null",
+      "asset_name": "fixed_asset のときの資産名（例: 営業車 ハイエース, ノートPC, 業務用冷蔵庫）。それ以外は null",
+      "asset_category": "fixed_asset のときの資産区分（車両運搬具/工具器具備品/機械装置/建物/建物附属設備/ソフトウェア 等）。それ以外は null",
+      "useful_life": "fixed_asset のときの耐用年数（年。記載があれば数値）。無ければ null",
+      "net_amount": "ec_payout のときの入金額（総売上から手数料を差し引いた振込額。数値のみ）。それ以外は null",
+      "note": "但し書き（例: 御飲食代として）。無ければ null",
+      "account": "この取引に最も近い勘定科目名を、末尾【勘定科目の候補】から1つだけ選ぶ（経費なら費用科目、売上なら収益科目）。候補に無い/判断できないなら null",
+      "confidence": "その1件の抽出の自信度を 0〜1 の数値で"
+    }
+  ]
+}
+
+balance_certificate（残高証明書）の場合: 口座ごとに receipts[] の1件にする。vendor=金融機関名＋支店、note=口座種別・口座番号、date=基準日、total_incl_tax=残高、direction=null（売上でも経費でもない）。tax_amount/tax_rate は null。
+
+fixed_asset（固定資産取得）の場合: 資産ごとに receipts[] の1件。vendor=購入先、date=取得日、total_incl_tax=取得価額（税込）、asset_name/asset_category/useful_life を埋める、direction=null（資産計上で経費でない）。
+
+ec_payout（EC/決済代行レポート）の場合: 対象期間×プラットフォームごとに receipts[] の1件。vendor=プラットフォーム名（楽天/Amazon/Square等）、period=対象期間、total_incl_tax=総売上、fee=手数料、net_amount=入金額、direction=sales（売上）。
+
+petty_cash（小口現金出納帳）の場合は bankbook と同じ transactions スキーマで出力する（withdrawal=出金/支払、deposit=入金/受入、balance=残高）。
+
+重要（金額が複数ある書類）: 振込金受取書・振込明細・払込取扱票など、「お振込金額／お支払金額（主たる金額）」と「振込手数料（少額）」が別々に記載されている書類では、total_incl_tax には主たる金額（通常は大きい方＝実際の振込・支払額）を入れ、手数料は fee に入れてください。手数料の金額（例: 770円）を total_incl_tax にしないでください。
+
+document_type が bankbook の場合のスキーマ（取引明細を上から順に1行ずつ全件。合計や見出し行は含めない）:
+{
+  "document_type": "bankbook",
+  "transactions": [
+    {
+      "date": "YYYY-MM-DD 形式の取引日（和暦・2桁年は西暦へ変換）。不明なら null",
+      "description": "摘要・お取扱内容（振込/カード/ATM/給与 等）。不明なら null",
+      "withdrawal": "お支払金額（出金、数値のみ）。無ければ null",
+      "deposit": "お預り金額（入金、数値のみ）。無ければ null",
+      "balance": "差引残高（数値のみ）。不明なら null",
+      "confidence": "その行の抽出の自信度を 0〜1 の数値で"
+    }
+  ]
+}
+
+document_type が inventory の場合のスキーマ（棚卸表。在庫品目を上から順に1行ずつ全件。合計行は含めない）:
+{
+  "document_type": "inventory",
+  "as_of_date": "棚卸基準日 YYYY-MM-DD（和暦は西暦へ）。不明なら null",
+  "lines": [
+    {
+      "item": "品名・商品名・規格。不明なら null",
+      "quantity": "数量（数値のみ）。不明なら null",
+      "unit_price": "単価（数値のみ）。不明なら null",
+      "amount": "金額（数量×単価。数値のみ）。不明なら null",
+      "confidence": "その行の抽出の自信度を 0〜1 の数値で"
+    }
+  ]
+}
+
+document_type が loan_schedule の場合のスキーマ（借入金の返済予定表。返済1回を上から順に1行ずつ全件。合計行は含めない）:
+{
+  "document_type": "loan_schedule",
+  "lender": "借入先金融機関名。不明なら null",
+  "lines": [
+    {
+      "date": "返済日 YYYY-MM-DD（和暦は西暦へ）。不明なら null",
+      "no": "回数（数値または文字。例: 第12回）。不明なら null",
+      "payment": "返済額（元金＋利息の合計。数値のみ）。不明なら null",
+      "principal": "元金部分（数値のみ）。不明なら null",
+      "interest": "利息部分（数値のみ）。不明なら null",
+      "balance": "返済後の残高（数値のみ）。不明なら null",
+      "confidence": "その行の抽出の自信度を 0〜1 の数値で"
+    }
+  ]
+}
+
+document_type が payslip / wage_ledger の場合のスキーマ（給与明細=従業員1名で lines に1件、賃金台帳=従業員×月の各行を1件ずつ全件）:
+{
+  "document_type": "payslip | wage_ledger",
+  "lines": [
+    {
+      "employee": "従業員名。不明なら null",
+      "pay_month": "対象支給月（YYYY-MM または 令和6年5月分 等）。不明なら null",
+      "gross": "総支給額（数値のみ）。不明なら null",
+      "health_insurance": "健康保険料（本人負担。介護保険含む。数値のみ）。無ければ null",
+      "pension": "厚生年金保険料（本人負担。数値のみ）。無ければ null",
+      "employment_insurance": "雇用保険料（本人負担。数値のみ）。無ければ null",
+      "income_tax": "源泉所得税（数値のみ）。無ければ null",
+      "resident_tax": "住民税（特別徴収。数値のみ）。無ければ null",
+      "other_deduction": "その他の控除合計（上記以外。数値のみ）。無ければ null",
+      "total_deduction": "控除合計（数値のみ）。不明なら null",
+      "net": "差引支給額（手取り。数値のみ）。不明なら null",
+      "confidence": "その行の抽出の自信度を 0〜1 の数値で"
+    }
+  ]
+}
+
+document_type が credit_card の場合のスキーマ（利用明細を上から順に1行ずつ全件。合計・繰越・キャッシング枠などの集計行は含めない）:
+{
+  "document_type": "credit_card",
+  "card_name": "カードの名称や発行会社（例: 楽天カード, 三井住友VISA）。不明なら null",
+  "transactions": [
+    {
+      "date": "YYYY-MM-DD 形式の利用日（和暦・2桁年は西暦へ変換）。不明なら null",
+      "description": "利用先・ご利用先店名（摘要）。不明なら null",
+      "amount": "利用金額（数値のみ。支払=プラスの数値）。返金・マイナスは負の数値。不明なら null",
+      "confidence": "その行の抽出の自信度を 0〜1 の数値で"
+    }
+  ]
+}
+
+該当する明細／レシートが1件も無ければ、その配列（receipts / transactions / lines）は空配列にしてください。`;
+
+function toNum(v: unknown): number | null {
+  if (v === null || v === undefined) return null;
+  if (typeof v === 'number') return Number.isNaN(v) ? null : v;
+  const n = Number(String(v).replace(/[^0-9.-]/g, ''));
+  return Number.isNaN(n) ? null : n;
+}
+
+function stripJson(text: string): string {
+  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fenced) return fenced[1].trim();
+  const s = text.indexOf('{');
+  const e = text.lastIndexOf('}');
+  return s >= 0 && e > s ? text.slice(s, e + 1) : text.trim();
+}
+
+// インボイス登録番号(T+法人番号13桁)のチェックディジット検証
+// 戻り値: true=妥当 / false=不正(誤読の可能性) / null=未取得で判定不能
+function validateRegistrationNumber(reg: unknown): boolean | null {
+  if (typeof reg !== 'string') return null;
+  const m = reg.match(/^T(\d{13})$/);
+  if (!m) return false;
+  const digits = m[1];
+  const check = Number(digits[0]); // 先頭がチェックディジット
+  const base = digits.slice(1); // 残り12桁
+  let sum = 0;
+  for (let i = 0; i < 12; i++) {
+    const p = Number(base[11 - i]); // 下n桁目(n=i+1)
+    const q = i % 2 === 0 ? 1 : 2; // nが奇数=1 / 偶数=2
+    sum += p * q;
+  }
+  return check === 9 - (sum % 9);
+}
+
+// 抽出結果の検算。怪しい点があれば notes に積む（弾かず「要確認」フラグ用）
+function validateExtraction(
+  ex: any,
+  total: number | null,
+  tax: number | null,
+  issued: string | null,
+): { needsReview: boolean; notes: string[] } {
+  const notes: string[] = [];
+
+  const regValid = validateRegistrationNumber(ex?.registration_number);
+  if (regValid === false) notes.push('登録番号の形式または検査数字が不正（誤読の可能性）');
+  if (regValid === true && issued && issued < '2023-10-01') {
+    notes.push(`日付 ${issued} が登録番号の存在(2023年10月以降)と矛盾（年の誤読の可能性）`);
+  }
+
+  const rateMap: Record<string, number> = { '10%': 0.1, '8%': 0.08 };
+  const r = ex?.tax_rate ? rateMap[ex.tax_rate] : undefined;
+  if (total != null && tax != null && r != null) {
+    const expected = Math.round(total - total / (1 + r));
+    if (Math.abs(tax - expected) > 2) {
+      notes.push(`消費税額が税率${ex.tax_rate}と不整合（税込${total}なら約${expected}円のはず）`);
+    }
+  }
+
+  const conf = toNum(ex?.confidence);
+  if (conf != null && conf < 0.7) notes.push(`信頼度が低い(${conf})`);
+
+  return { needsReview: notes.length > 0, notes };
+}
+
+type BankRow = {
+  line_no: number;
+  withdrawal: number | null;
+  deposit: number | null;
+  balance: number | null;
+  confidence: number | null;
+};
+
+// 通帳明細の残高検算。「前残高 + 入金 - 出金 = 当残高」が成り立たない行を誤読候補として拾う。
+// 弾かず needs_review フラグ用。残高が読めない行はスキップ（判定不能）。
+function validateBankTransactions(rows: BankRow[]): {
+  needsReview: boolean;
+  notes: string[];
+  badLines: number[];
+} {
+  const notes: string[] = [];
+  const badLines: number[] = [];
+
+  for (let i = 1; i < rows.length; i++) {
+    const prev = rows[i - 1];
+    const cur = rows[i];
+    if (prev.balance == null || cur.balance == null) continue; // 残高未取得は判定不能
+    const delta = cur.balance - prev.balance; // 残高の増減
+    const txn = (cur.deposit ?? 0) - (cur.withdrawal ?? 0); // 取引額（入金+ / 出金-）
+    if (Math.abs(delta - txn) > 1) {
+      badLines.push(cur.line_no);
+    }
+  }
+  if (badLines.length) {
+    notes.push(`残高が不整合の行: ${badLines.join(', ')}行目（金額または残高の誤読の可能性）`);
+  }
+
+  const low = rows.filter((r) => r.confidence != null && (r.confidence as number) < 0.7).length;
+  if (low > 0) notes.push(`信頼度が低い行が${low}件`);
+
+  return { needsReview: notes.length > 0, notes, badLines };
+}
+
+type LoanRow = {
+  line_no: number;
+  amount: number | null; // 返済額
+  principal: number | null; // 元金
+  interest: number | null; // 利息
+  balance: number | null; // 残高
+};
+
+// 返済予定表の検算。「返済額=元金+利息」「前残高-元金=当残高」が合わない行を誤読候補に。
+// 手書き等の桁・数字の読み違いを炙り出す（弾かず needs_review）。
+function validateLoanSchedule(rows: LoanRow[]): { notes: string[]; badLines: number[] } {
+  const bad = new Set<number>();
+  for (const r of rows) {
+    if (r.amount != null && r.principal != null && r.interest != null) {
+      if (Math.abs(r.amount - (r.principal + r.interest)) > 1) bad.add(r.line_no);
+    }
+  }
+  for (let i = 1; i < rows.length; i++) {
+    const prev = rows[i - 1];
+    const cur = rows[i];
+    if (prev.balance != null && cur.balance != null && cur.principal != null) {
+      if (Math.abs(prev.balance - cur.principal - cur.balance) > 1) bad.add(cur.line_no);
+    }
+  }
+  const badLines = [...bad].sort((a, b) => a - b);
+  const notes: string[] = [];
+  if (badLines.length) {
+    notes.push(`返済額=元金+利息／前残高-元金=当残高 が合わない行: ${badLines.join(', ')}行目（手書き等の誤読の可能性）`);
+  }
+  return { notes, badLines };
+}
+
+type InvRow = { line_no: number; quantity: number | null; unit_price: number | null; amount: number | null };
+
+// 棚卸表の検算。「数量×単価=金額」が合わない行を誤読候補に（弾かず needs_review）。
+function validateInventory(rows: InvRow[]): { notes: string[]; badLines: number[] } {
+  const badLines: number[] = [];
+  for (const r of rows) {
+    if (r.quantity != null && r.unit_price != null && r.amount != null) {
+      const expected = r.quantity * r.unit_price;
+      if (Math.abs(expected - r.amount) > Math.max(1, Math.abs(r.amount) * 0.01)) badLines.push(r.line_no);
+    }
+  }
+  const notes: string[] = [];
+  if (badLines.length) {
+    notes.push(`数量×単価=金額 が合わない行: ${badLines.join(', ')}行目（手書き等の誤読の可能性）`);
+  }
+  return { notes, badLines };
+}
+
+type PayRow = {
+  line_no: number;
+  gross: number | null;
+  health_insurance: number | null;
+  pension: number | null;
+  employment_insurance: number | null;
+  income_tax: number | null;
+  resident_tax: number | null;
+  other_deduction: number | null;
+  total_deduction: number | null;
+  net: number | null;
+};
+
+// 給与の検算。「総支給-控除合計=差引」「控除内訳の合計=控除合計」が合わない行を誤読候補に。
+function validatePayroll(rows: PayRow[]): { notes: string[]; badLines: number[] } {
+  const bad = new Set<number>();
+  for (const r of rows) {
+    const parts = [r.health_insurance, r.pension, r.employment_insurance, r.income_tax, r.resident_tax, r.other_deduction];
+    const sumParts = parts.reduce((s, v) => s + (v ?? 0), 0);
+    if (r.total_deduction != null && parts.some((v) => v != null) && Math.abs(sumParts - r.total_deduction) > 1) {
+      bad.add(r.line_no);
+    }
+    if (r.gross != null && r.total_deduction != null && r.net != null && Math.abs(r.gross - r.total_deduction - r.net) > 1) {
+      bad.add(r.line_no);
+    }
+  }
+  const badLines = [...bad].sort((a, b) => a - b);
+  const notes = badLines.length
+    ? [`総支給-控除合計=差引／控除内訳の合計 が合わない行: ${badLines.join(', ')}行目（誤読の可能性）`]
+    : [];
+  return { notes, badLines };
+}
+
+// 画像/PDF を Claude Opus 4.8 に渡して構造化データ（複数件）を抽出
+async function extractDocument(
+  buffer: Buffer,
+  contentType: string,
+  clientName?: string,
+  accounts?: Account[],
+): Promise<any> {
+  const today = new Date().toISOString().slice(0, 10);
+  // 提出者（顧問先）名が分かれば、売上/経費の向き判定に使わせる
+  const directionHint = clientName
+    ? `\n\n【提出者】この書類を送ってきた顧問先（提出者）は「${clientName}」です。各証憑の direction を次の基準で判定してください: 発行元（vendor）が「${clientName}」＝顧問先自身なら sales（売上）。宛名/支払側が「${clientName}」、または発行元が他社（仕入先・店舗など）なら expense（経費）。会社名は表記揺れ（株式会社/(株)/前株後株/支店名）があり得るので柔軟に判断。確信が持てなければ null。`
+    : '';
+  // 勘定科目の候補（費用・収益）を提示して account を選ばせる。マスタが無ければ提示しない。
+  const expenseNames = (accounts ?? []).filter((a) => a.category === 'expense').map((a) => a.name);
+  const revenueNames = (accounts ?? []).filter((a) => a.category === 'revenue').map((a) => a.name);
+  const accountHint = expenseNames.length
+    ? `\n\n【勘定科目の候補】各 receipts[].account は次の候補から最も近いものを1つだけ選んでください。\n費用科目: ${expenseNames.join('、')}\n収益科目: ${revenueNames.join('、')}\n迷う場合・候補に無い場合は null（後で事務所が修正します）。`
+    : '';
+  const prompt = `${EXTRACTION_PROMPT}
+
+今日は ${today} です。日付の2桁年（例:「26」）は西暦の下2桁とみなし、今日に最も近い年として解釈してください（例: 今日が2026年なら「26-05-18」は 2026-05-18）。和暦（令和/平成）表記は西暦に変換してください。${directionHint}${accountHint}`;
+
+  const isPdf = contentType.includes('pdf');
+  const allowed = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
+  const block = isPdf
+    ? {
+        type: 'document',
+        source: { type: 'base64', media_type: 'application/pdf', data: buffer.toString('base64') },
+      }
+    : {
+        type: 'image',
+        source: {
+          type: 'base64',
+          media_type: (allowed.includes(contentType) ? contentType : 'image/jpeg') as any,
+          data: buffer.toString('base64'),
+        },
+      };
+
+  // 多件数でも途中で切れないよう出力上限を確保し、ストリーミングでタイムアウトを回避
+  const stream = anthropic.messages.stream({
+    model: 'claude-opus-4-8',
+    max_tokens: 16000,
+    messages: [{ role: 'user', content: [block as any, { type: 'text', text: prompt }] }],
+  });
+  const final: any = await stream.finalMessage();
+  const text = (final.content ?? [])
+    .filter((b: any) => b.type === 'text')
+    .map((b: any) => b.text)
+    .join('');
+  return JSON.parse(stripJson(text));
+}
+
+type SaveCtx = {
+  messageId: string;
+  path: string;
+  contentType: string;
+  imageHash: string | null; // 重複弾き用ハッシュ。代表1件のみ付与、他は null
+  docType?: string | null; // receipt / invoice / bankbook / other
+  clientId?: string | null; // どの顧問先の書類か
+  clientName?: string | null; // 顧問先名（売上/経費の向き判定のフォールバック用）
+  officeId?: string | null; // どの事務所宛か（未解決=null。後方互換のため null なら列を付けない）
+  accounts?: Account[]; // 事務所の勘定科目マスタ（科目自動付与用。未適用なら空）
+};
+
+// 会社名の表記揺れを吸収して比較するための正規化（法人格・空白を除去）
+function normName(s: unknown): string {
+  return String(s ?? '')
+    .replace(/株式会社|有限会社|合同会社|（株）|\(株\)|㈱|（有）|\(有\)|㈲|（同）|\(同\)/g, '')
+    .replace(/[\s　]/g, '')
+    .toLowerCase();
+}
+
+// 売上(sales)か経費(expense)かを判定。まずモデルの direction を採用し、
+// 無ければ顧問先名と発行元/宛名の一致で推定。判定不能なら null。
+function resolveDirection(ex: any, clientName?: string | null): 'sales' | 'expense' | null {
+  if (ex?.direction === 'sales' || ex?.direction === 'expense') return ex.direction;
+  const cn = normName(clientName);
+  if (!cn) return null;
+  const iss = normName(ex?.vendor);
+  const rcp = normName(ex?.recipient);
+  const issuerIsClient = !!iss && (iss.includes(cn) || cn.includes(iss));
+  const recipientIsClient = !!rcp && (rcp.includes(cn) || cn.includes(rcp));
+  if (issuerIsClient && !recipientIsClient) return 'sales';
+  if (recipientIsClient && !issuerIsClient) return 'expense';
+  return null;
+}
+
+// receipts への共通 INSERT 値を組み立てる。office_id は解決済みのときだけ付与し、
+// マイグレーション未適用（office_id 列なし）でも壊れないようにする
+function receiptInsertValues(ctx: SaveCtx, docType: string | null) {
+  const base: Record<string, unknown> = {
+    original_filename: ctx.messageId,
+    source: 'LINE',
+    document_type: docType,
+    client_id: ctx.clientId ?? null,
+  };
+  if (ctx.officeId) base.office_id = ctx.officeId;
+  return base;
+}
+
+// 抽出1件分を保存し、返信用サマリ行を返す
+async function saveReceipt(ex: any, ctx: SaveCtx): Promise<string> {
+  const { data: receipt } = await supabase
+    .from('receipts')
+    .insert(receiptInsertValues(ctx, ctx.docType ?? null))
+    .select()
+    .single();
+
+  await supabase.from('receipt_images').insert({
+    receipt_id: receipt?.id ?? null,
+    storage_path: ctx.path,
+    content_type: ctx.contentType,
+    image_sha256: ctx.imageHash,
+  });
+
+  const total = toNum(ex?.total_incl_tax);
+  const tax = toNum(ex?.tax_amount);
+  const fee = toNum(ex?.fee);
+  const net = total != null && tax != null ? total - tax : null;
+  const issued =
+    typeof ex?.date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(ex.date) ? ex.date : null;
+  const conf = toNum(ex?.confidence);
+
+  // 売上/経費の向きと「取引先（顧問先から見た相手方）」を決める。
+  // 残高証明書・固定資産は B/S 項目で売上でも経費でもない→ direction=null。
+  const isBalance = ctx.docType === 'balance_certificate';
+  const isAsset = ctx.docType === 'fixed_asset';
+  const noDir = isBalance || isAsset;
+  const dir = noDir ? null : resolveDirection(ex, ctx.clientName);
+  const direction = noDir ? null : dir ?? 'expense'; // 不明は経費として仮置き（needs_review で拾う）
+  const counterparty =
+    direction === 'sales' ? ex?.recipient ?? ex?.vendor ?? null : ex?.vendor ?? ex?.recipient ?? null;
+
+  await supabase
+    .from('receipts')
+    .update({
+      amount: net,
+      total_amount: total,
+      tax_amount: tax,
+      issued_date: issued,
+      description: ex?.note ?? null,
+    })
+    .eq('id', receipt?.id);
+
+  // direction は別ステートメントで更新（migration 008 未適用でも本体保存を壊さない。
+  // 列が無ければこの update だけ失敗し、向きは extracted_fields 側に残る）。
+  await supabase.from('receipts').update({ direction }).eq('id', receipt?.id);
+
+  // 勘定科目の自動付与（残高証明書は仕訳対象外なのでスキップ）。
+  // migration 011 未適用でも本体保存を壊さないよう別ステートメント＆try で握りつぶす。
+  if (!isBalance && ctx.accounts && ctx.accounts.length) {
+    const acc = autoAccount(ex, ctx.docType ?? null, noDir ? null : direction, ctx.accounts, ex?.account);
+    if (acc.accountCode) {
+      try {
+        await supabase
+          .from('receipts')
+          .update({
+            account_code: acc.accountCode,
+            payment_account_code: acc.paymentCode,
+            account_source: 'auto',
+          })
+          .eq('id', receipt?.id);
+      } catch {
+        /* 列が無ければ無視 */
+      }
+    }
+  }
+
+  const fieldRows = (
+    [
+      ['vendor', ex?.vendor],
+      ['recipient', ex?.recipient],
+      ['direction', direction],
+      ['counterparty', counterparty],
+      ['registration_number', ex?.registration_number],
+      ['tax_rate', ex?.tax_rate],
+      ['receipt_no', ex?.receipt_no],
+      ['tax_kind', ex?.tax_kind],
+      ['period', ex?.period],
+      ['asset_name', ex?.asset_name],
+      ['asset_category', ex?.asset_category],
+      ['useful_life', ex?.useful_life],
+      ['net_amount', toNum(ex?.net_amount)],
+      ['note', ex?.note],
+      ['date', ex?.date],
+      ['total_incl_tax', total],
+      ['fee', fee],
+      ['tax_amount', tax],
+    ] as [string, unknown][]
+  )
+    .filter(([, v]) => v !== null && v !== undefined && v !== '')
+    .map(([field_name, value]) => ({
+      receipt_id: receipt?.id ?? null,
+      field_name,
+      field_value: String(value),
+      confidence: conf,
+      source: 'claude-opus-4-8',
+    }));
+
+  const validation = validateExtraction(ex, total, tax, issued);
+  // 向きが判定できなかった場合も要確認に含める（残高証明書・固定資産は元々 direction なしなので除外）
+  const dirAmbiguous = dir === null && !noDir;
+  const notes = [...validation.notes];
+  if (dirAmbiguous) notes.push('売上/経費の自動判定ができず経費として仮置き');
+  const needsReview = validation.needsReview || dirAmbiguous;
+  fieldRows.push({
+    receipt_id: receipt?.id ?? null,
+    field_name: 'needs_review',
+    field_value: String(needsReview),
+    confidence: null,
+    source: 'validation',
+  });
+  if (notes.length) {
+    fieldRows.push({
+      receipt_id: receipt?.id ?? null,
+      field_name: 'validation_notes',
+      field_value: notes.join(' / '),
+      confidence: null,
+      source: 'validation',
+    });
+  }
+  if (fieldRows.length) await supabase.from('extracted_fields').insert(fieldRows);
+
+  const now = new Date().toISOString();
+  await supabase.from('processing_jobs').insert({
+    receipt_id: receipt?.id ?? null,
+    status: 'done',
+    queued_at: now,
+    started_at: now,
+    finished_at: now,
+  });
+
+  const yen = total != null ? `¥${total.toLocaleString()}` : '金額不明';
+  const feeStr = fee != null ? `（手数料¥${fee.toLocaleString()}）` : '';
+  const warn = needsReview ? ' ⚠️要確認' : '';
+  // 納付書は【納付】＋税目、残高証明は【残高】、固定資産は【資産】、それ以外は売上/経費
+  const isTax = ctx.docType === 'tax_payment';
+  const head = isTax
+    ? `【納付】${ex?.tax_kind ?? '税金・社保'}`
+    : isBalance
+      ? '【残高】'
+      : isAsset
+        ? '【資産】'
+        : direction === 'sales'
+          ? '【売上】'
+          : '【経費】';
+  const who = isBalance
+    ? ex?.vendor ?? '口座不明'
+    : isAsset
+      ? ex?.asset_name ?? ex?.vendor ?? '資産名不明'
+      : isTax
+        ? ex?.vendor ?? counterparty ?? '納付先不明'
+        : counterparty ?? '取引先不明';
+  return `${head}${head.endsWith('】') ? '' : ' '}${who} / ${issued ?? '日付不明'} / ${yen}${feeStr}${warn}`;
+}
+
+// 通帳1冊分（取引明細の配列）を保存し、件数と残高検算の結果を返す
+async function saveBankTransactions(
+  txns: any[],
+  ctx: SaveCtx,
+): Promise<{ count: number; validation: ReturnType<typeof validateBankTransactions> }> {
+  const { data: receipt } = await supabase
+    .from('receipts')
+    .insert(receiptInsertValues(ctx, ctx.docType ?? 'bankbook'))
+    .select()
+    .single();
+
+  await supabase.from('receipt_images').insert({
+    receipt_id: receipt?.id ?? null,
+    storage_path: ctx.path,
+    content_type: ctx.contentType,
+    image_sha256: ctx.imageHash,
+  });
+
+  const rows = txns.map((t, i) => ({
+    receipt_id: receipt?.id ?? null,
+    line_no: i + 1,
+    txn_date: typeof t?.date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(t.date) ? t.date : null,
+    description: t?.description ?? null,
+    withdrawal: toNum(t?.withdrawal),
+    deposit: toNum(t?.deposit),
+    balance: toNum(t?.balance),
+    confidence: toNum(t?.confidence),
+    source: 'claude-opus-4-8',
+  }));
+  if (rows.length) await supabase.from('bank_transactions').insert(rows);
+
+  // 残高検算（誤読候補は弾かず needs_review として記録）
+  const validation = validateBankTransactions(rows);
+  const fieldRows = [
+    {
+      receipt_id: receipt?.id ?? null,
+      field_name: 'needs_review',
+      field_value: String(validation.needsReview),
+      confidence: null,
+      source: 'validation',
+    },
+  ];
+  if (validation.notes.length) {
+    fieldRows.push({
+      receipt_id: receipt?.id ?? null,
+      field_name: 'validation_notes',
+      field_value: validation.notes.join(' / '),
+      confidence: null,
+      source: 'validation',
+    });
+  }
+  await supabase.from('extracted_fields').insert(fieldRows);
+
+  const now = new Date().toISOString();
+  await supabase.from('processing_jobs').insert({
+    receipt_id: receipt?.id ?? null,
+    status: 'done',
+    queued_at: now,
+    started_at: now,
+    finished_at: now,
+  });
+
+  return { count: rows.length, validation };
+}
+
+// クレジットカード明細1枚分を保存し、件数・合計を返す。
+// 明細行は通帳と同じ bank_transactions に格納（利用金額=withdrawal=支出）。direction は経費固定。
+async function saveCardStatement(
+  txns: any[],
+  ctx: SaveCtx,
+  cardName: string | null,
+): Promise<{ count: number; total: number }> {
+  const values = receiptInsertValues(ctx, 'credit_card');
+  const { data: receipt } = await supabase.from('receipts').insert(values).select().single();
+
+  await supabase.from('receipt_images').insert({
+    receipt_id: receipt?.id ?? null,
+    storage_path: ctx.path,
+    content_type: ctx.contentType,
+    image_sha256: ctx.imageHash,
+  });
+
+  const rows = txns.map((t, i) => ({
+    receipt_id: receipt?.id ?? null,
+    line_no: i + 1,
+    txn_date: typeof t?.date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(t.date) ? t.date : null,
+    description: t?.description ?? null,
+    withdrawal: toNum(t?.amount), // 利用金額=支出として通帳列を流用
+    deposit: null,
+    balance: null,
+    confidence: toNum(t?.confidence),
+    source: 'claude-opus-4-8',
+  }));
+  if (rows.length) await supabase.from('bank_transactions').insert(rows);
+
+  const total = rows.reduce((s, r) => s + (r.withdrawal ?? 0), 0);
+  const low = rows.filter((r) => r.confidence != null && (r.confidence as number) < 0.7).length;
+
+  // カードは経費。集計の取り違え防止に direction=expense を付与（best-effort）
+  await supabase.from('receipts').update({ direction: 'expense', total_amount: total }).eq('id', receipt?.id);
+
+  const fieldRows: any[] = [
+    { receipt_id: receipt?.id ?? null, field_name: 'direction', field_value: 'expense', source: 'claude-opus-4-8' },
+    { receipt_id: receipt?.id ?? null, field_name: 'needs_review', field_value: String(low > 0), source: 'validation' },
+  ];
+  if (cardName) {
+    fieldRows.push({ receipt_id: receipt?.id ?? null, field_name: 'vendor', field_value: cardName, source: 'claude-opus-4-8' });
+    fieldRows.push({ receipt_id: receipt?.id ?? null, field_name: 'counterparty', field_value: cardName, source: 'claude-opus-4-8' });
+  }
+  if (low > 0) {
+    fieldRows.push({ receipt_id: receipt?.id ?? null, field_name: 'validation_notes', field_value: `信頼度が低い行が${low}件`, source: 'validation' });
+  }
+  await supabase.from('extracted_fields').insert(fieldRows);
+
+  const now = new Date().toISOString();
+  await supabase.from('processing_jobs').insert({
+    receipt_id: receipt?.id ?? null,
+    status: 'done',
+    queued_at: now,
+    started_at: now,
+    finished_at: now,
+  });
+
+  return { count: rows.length, total };
+}
+
+// 棚卸表1枚分を保存。明細は document_lines(line_type='inventory')へ。total_amount=期末在庫金額。
+async function saveInventory(
+  lines: any[],
+  ctx: SaveCtx,
+  asOfDate: string | null,
+): Promise<{ count: number; total: number; badLines: number[] }> {
+  const { data: receipt } = await supabase
+    .from('receipts')
+    .insert(receiptInsertValues(ctx, 'inventory'))
+    .select()
+    .single();
+
+  await supabase.from('receipt_images').insert({
+    receipt_id: receipt?.id ?? null,
+    storage_path: ctx.path,
+    content_type: ctx.contentType,
+    image_sha256: ctx.imageHash,
+  });
+
+  const rows = lines.map((l, i) => ({
+    receipt_id: receipt?.id ?? null,
+    line_no: i + 1,
+    line_type: 'inventory',
+    label: l?.item ?? null,
+    quantity: toNum(l?.quantity),
+    unit_price: toNum(l?.unit_price),
+    amount: toNum(l?.amount),
+    confidence: toNum(l?.confidence),
+    source: 'claude-opus-4-8',
+  }));
+  if (rows.length) await supabase.from('document_lines').insert(rows);
+
+  const total = rows.reduce((s, r) => s + (r.amount ?? 0), 0);
+  const issued = typeof asOfDate === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(asOfDate) ? asOfDate : null;
+  const low = rows.filter((r) => r.confidence != null && (r.confidence as number) < 0.7).length;
+  // 棚卸資産は B/S 項目で売上/経費ではない（direction=null）。total_amount=期末在庫金額
+  await supabase.from('receipts').update({ total_amount: total, issued_date: issued }).eq('id', receipt?.id);
+
+  // 数量×単価=金額 の検算で誤読候補を拾う
+  const v = validateInventory(rows);
+  const notes = [...v.notes];
+  if (low > 0) notes.push(`信頼度が低い行が${low}件`);
+  const needsReview = notes.length > 0;
+  const fieldRows: any[] = [
+    { receipt_id: receipt?.id ?? null, field_name: 'needs_review', field_value: String(needsReview), source: 'validation' },
+  ];
+  if (notes.length) fieldRows.push({ receipt_id: receipt?.id ?? null, field_name: 'validation_notes', field_value: notes.join(' / '), source: 'validation' });
+  await supabase.from('extracted_fields').insert(fieldRows);
+
+  const now = new Date().toISOString();
+  await supabase.from('processing_jobs').insert({ receipt_id: receipt?.id ?? null, status: 'done', queued_at: now, started_at: now, finished_at: now });
+  return { count: rows.length, total, badLines: v.badLines };
+}
+
+// 借入金返済予定表1枚分を保存。明細は document_lines(line_type='loan_schedule')へ。
+async function saveLoanSchedule(
+  lines: any[],
+  ctx: SaveCtx,
+  lender: string | null,
+): Promise<{ count: number; badLines: number[] }> {
+  const { data: receipt } = await supabase
+    .from('receipts')
+    .insert(receiptInsertValues(ctx, 'loan_schedule'))
+    .select()
+    .single();
+
+  await supabase.from('receipt_images').insert({
+    receipt_id: receipt?.id ?? null,
+    storage_path: ctx.path,
+    content_type: ctx.contentType,
+    image_sha256: ctx.imageHash,
+  });
+
+  const rows = lines.map((l, i) => ({
+    receipt_id: receipt?.id ?? null,
+    line_no: i + 1,
+    line_type: 'loan_schedule',
+    label: l?.no != null ? String(l.no) : null,
+    line_date: typeof l?.date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(l.date) ? l.date : null,
+    amount: toNum(l?.payment),
+    principal: toNum(l?.principal),
+    interest: toNum(l?.interest),
+    balance: toNum(l?.balance),
+    confidence: toNum(l?.confidence),
+    source: 'claude-opus-4-8',
+  }));
+  if (rows.length) await supabase.from('document_lines').insert(rows);
+
+  // 返済額=元金+利息／残高推移 の検算で誤読候補を拾う
+  const v = validateLoanSchedule(
+    rows.map((r) => ({ line_no: r.line_no, amount: r.amount, principal: r.principal, interest: r.interest, balance: r.balance })),
+  );
+  const low = rows.filter((r) => r.confidence != null && (r.confidence as number) < 0.7).length;
+  const notes = [...v.notes];
+  if (low > 0) notes.push(`信頼度が低い行が${low}件`);
+  const needsReview = notes.length > 0;
+  const fieldRows: any[] = [
+    { receipt_id: receipt?.id ?? null, field_name: 'needs_review', field_value: String(needsReview), source: 'validation' },
+  ];
+  if (lender) {
+    fieldRows.push({ receipt_id: receipt?.id ?? null, field_name: 'vendor', field_value: lender, source: 'claude-opus-4-8' });
+    fieldRows.push({ receipt_id: receipt?.id ?? null, field_name: 'counterparty', field_value: lender, source: 'claude-opus-4-8' });
+  }
+  if (notes.length) fieldRows.push({ receipt_id: receipt?.id ?? null, field_name: 'validation_notes', field_value: notes.join(' / '), source: 'validation' });
+  await supabase.from('extracted_fields').insert(fieldRows);
+
+  const now = new Date().toISOString();
+  await supabase.from('processing_jobs').insert({ receipt_id: receipt?.id ?? null, status: 'done', queued_at: now, started_at: now, finished_at: now });
+  return { count: rows.length, badLines: v.badLines };
+}
+
+// 給与明細/賃金台帳1枚分を保存。従業員行は payroll_lines へ。total_amount=総支給合計、direction=経費（人件費）。
+async function savePayroll(
+  lines: any[],
+  ctx: SaveCtx,
+  docType: string,
+): Promise<{ count: number; total: number; badLines: number[] }> {
+  const { data: receipt } = await supabase
+    .from('receipts')
+    .insert(receiptInsertValues(ctx, docType))
+    .select()
+    .single();
+
+  await supabase.from('receipt_images').insert({
+    receipt_id: receipt?.id ?? null,
+    storage_path: ctx.path,
+    content_type: ctx.contentType,
+    image_sha256: ctx.imageHash,
+  });
+
+  const rows = lines.map((l, i) => ({
+    receipt_id: receipt?.id ?? null,
+    line_no: i + 1,
+    employee: l?.employee ?? null,
+    pay_month: l?.pay_month != null ? String(l.pay_month) : null,
+    gross: toNum(l?.gross),
+    health_insurance: toNum(l?.health_insurance),
+    pension: toNum(l?.pension),
+    employment_insurance: toNum(l?.employment_insurance),
+    income_tax: toNum(l?.income_tax),
+    resident_tax: toNum(l?.resident_tax),
+    other_deduction: toNum(l?.other_deduction),
+    total_deduction: toNum(l?.total_deduction),
+    net: toNum(l?.net),
+    confidence: toNum(l?.confidence),
+    source: 'claude-opus-4-8',
+  }));
+  if (rows.length) await supabase.from('payroll_lines').insert(rows);
+
+  const total = rows.reduce((s, r) => s + (r.gross ?? 0), 0);
+  const v = validatePayroll(rows);
+  const low = rows.filter((r) => r.confidence != null && (r.confidence as number) < 0.7).length;
+  const notes = [...v.notes];
+  if (low > 0) notes.push(`信頼度が低い行が${low}件`);
+  const needsReview = notes.length > 0;
+
+  // 給与は人件費=経費。total_amount=総支給合計。科目=給料手当(6020)/相手=現金(1010)
+  await supabase.from('receipts').update({ direction: 'expense', total_amount: total }).eq('id', receipt?.id);
+  try {
+    await supabase
+      .from('receipts')
+      .update({ account_code: '6020', payment_account_code: '1010', account_source: 'auto' })
+      .eq('id', receipt?.id);
+  } catch {
+    /* 列が無ければ無視 */
+  }
+
+  const fieldRows: any[] = [
+    { receipt_id: receipt?.id ?? null, field_name: 'direction', field_value: 'expense', source: 'claude-opus-4-8' },
+    { receipt_id: receipt?.id ?? null, field_name: 'needs_review', field_value: String(needsReview), source: 'validation' },
+  ];
+  if (notes.length) fieldRows.push({ receipt_id: receipt?.id ?? null, field_name: 'validation_notes', field_value: notes.join(' / '), source: 'validation' });
+  await supabase.from('extracted_fields').insert(fieldRows);
+
+  const now = new Date().toISOString();
+  await supabase.from('processing_jobs').insert({ receipt_id: receipt?.id ?? null, status: 'done', queued_at: now, started_at: now, finished_at: now });
+  return { count: rows.length, total, badLines: v.badLines };
+}
+
+// 抽出失敗・該当なし時：画像は保存しつつハッシュは付けない（=再送で再処理できる）
+async function saveUnprocessed(ctx: Omit<SaveCtx, 'imageHash'>, errorText: string) {
+  const { data: r } = await supabase
+    .from('receipts')
+    .insert(receiptInsertValues({ ...ctx, imageHash: null }, ctx.docType ?? null))
+    .select()
+    .single();
+  await supabase.from('receipt_images').insert({
+    receipt_id: r?.id ?? null,
+    storage_path: ctx.path,
+    content_type: ctx.contentType,
+  });
+  const now = new Date().toISOString();
+  await supabase.from('processing_jobs').insert({
+    receipt_id: r?.id ?? null,
+    status: 'failed',
+    error: errorText,
+    queued_at: now,
+    finished_at: now,
+  });
+}
+
+// ════════════ ここまでインライン・パイプライン ════════════
+
+// ───────── 認証（/api/my と同じ署名付き Cookie） ─────────
+function verifySession(value: string | undefined): string | null {
+  if (!value) return null;
+  const i = value.lastIndexOf('.');
+  if (i < 0) return null;
+  const clientId = value.slice(0, i);
+  const sig = value.slice(i + 1);
+  const expect = crypto.createHmac('sha256', SUPABASE_KEY).update(clientId).digest('base64url');
+  const a = Buffer.from(sig);
+  const b = Buffer.from(expect);
+  return a.length === b.length && crypto.timingSafeEqual(a, b) ? clientId : null;
+}
+function parseCookies(req: VercelRequest): Record<string, string> {
+  const out: Record<string, string> = {};
+  const raw = req.headers.cookie;
+  if (!raw) return out;
+  for (const part of raw.split(';')) {
+    const idx = part.indexOf('=');
+    if (idx > 0) out[part.slice(0, idx).trim()] = decodeURIComponent(part.slice(idx + 1).trim());
+  }
+  return out;
+}
+
+// アップロード1ファイルを処理（LINE webhook の1ファイル分岐と同じ。返信の代わりに結果を返す）
+async function processUpload(
+  buffer: Buffer,
+  contentType: string,
+  filename: string,
+  client: any,
+  accounts: Account[],
+): Promise<{ ok: boolean; message: string; docType?: string | null; review?: boolean }> {
+  const isPdf = contentType.includes('pdf');
+  const isImage = contentType.startsWith('image/');
+  if (!isPdf && !isImage) return { ok: false, message: '対応していない形式です（画像かPDFを送ってください）。' };
+
+  // 完全同一ファイルの重複弾き（SHA-256）
+  const fileHash = crypto.createHash('sha256').update(buffer).digest('hex');
+  const { data: dup } = await supabase.from('receipt_images').select('id').eq('image_sha256', fileHash).limit(1);
+  if (dup && dup.length > 0) return { ok: false, message: 'この書類は既に受信済みです。' };
+
+  // Storage に保存（キーに使えない文字は置換）
+  const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const rand = crypto.randomBytes(4).toString('hex');
+  const path = `receipts/${timestamp}_up_${rand}${isPdf ? '.pdf' : ''}`;
+  const { error: upErr } = await supabase.storage.from('receipts').upload(path, buffer, { contentType });
+  if (upErr) throw upErr;
+
+  const saveCtx: any = {
+    messageId: filename || `アップロード_${rand}`,
+    path,
+    contentType,
+    clientId: client.id,
+    clientName: client.official_name,
+    officeId: client.office_id ?? null,
+    accounts,
+  };
+
+  let doc: any;
+  try {
+    doc = await extractDocument(buffer, contentType, client.official_name, accounts);
+  } catch (e) {
+    console.error('Extraction error:', e);
+    await saveUnprocessed(saveCtx, String(e));
+    return { ok: true, message: 'ファイルを保存しました（解析でエラーが出たため後ほど再処理します）。' };
+  }
+
+  const docType = typeof doc?.document_type === 'string' ? doc.document_type : null;
+  const warnTxt = (b: number[]) => (b.length ? `（⚠️ ${b.join(', ')}行目は要確認）` : '');
+
+  if (docType === 'bankbook' || docType === 'petty_cash') {
+    const label = docType === 'petty_cash' ? '小口現金出納帳' : '通帳';
+    const txns: any[] = Array.isArray(doc?.transactions) ? doc.transactions.filter((t: any) => t && typeof t === 'object') : [];
+    if (txns.length === 0) { await saveUnprocessed({ ...saveCtx, docType }, 'no_transactions_found'); return { ok: false, message: `${label}から読み取れる取引明細が見つかりませんでした。` }; }
+    const { count, validation } = await saveBankTransactions(txns, { ...saveCtx, imageHash: fileHash, docType });
+    return { ok: true, docType, review: validation.badLines.length > 0, message: `${label}を登録しました（明細${count}件）${warnTxt(validation.badLines)}` };
+  }
+  if (docType === 'credit_card') {
+    const txns: any[] = Array.isArray(doc?.transactions) ? doc.transactions.filter((t: any) => t && typeof t === 'object') : [];
+    if (txns.length === 0) { await saveUnprocessed({ ...saveCtx, docType }, 'no_card_transactions_found'); return { ok: false, message: 'カード明細から読み取れる利用明細が見つかりませんでした。' }; }
+    const cardName = typeof doc?.card_name === 'string' ? doc.card_name : null;
+    const { count, total } = await saveCardStatement(txns, { ...saveCtx, imageHash: fileHash, docType }, cardName);
+    return { ok: true, docType, message: `${cardName ? `カード明細（${cardName}）` : 'カード明細'}を登録しました（${count}件・合計¥${total.toLocaleString()}）` };
+  }
+  if (docType === 'inventory') {
+    const lines: any[] = Array.isArray(doc?.lines) ? doc.lines.filter((l: any) => l && typeof l === 'object') : [];
+    if (lines.length === 0) { await saveUnprocessed({ ...saveCtx, docType }, 'no_inventory_lines_found'); return { ok: false, message: '棚卸表から読み取れる品目が見つかりませんでした。' }; }
+    const asOf = typeof doc?.as_of_date === 'string' ? doc.as_of_date : null;
+    const { count, total, badLines } = await saveInventory(lines, { ...saveCtx, imageHash: fileHash, docType }, asOf);
+    return { ok: true, docType, review: badLines.length > 0, message: `棚卸表を登録しました（${count}品目・在庫金額¥${total.toLocaleString()}）${warnTxt(badLines)}` };
+  }
+  if (docType === 'loan_schedule') {
+    const lines: any[] = Array.isArray(doc?.lines) ? doc.lines.filter((l: any) => l && typeof l === 'object') : [];
+    if (lines.length === 0) { await saveUnprocessed({ ...saveCtx, docType }, 'no_loan_lines_found'); return { ok: false, message: '返済予定表から読み取れる明細が見つかりませんでした。' }; }
+    const lender = typeof doc?.lender === 'string' ? doc.lender : null;
+    const { count, badLines } = await saveLoanSchedule(lines, { ...saveCtx, imageHash: fileHash, docType }, lender);
+    return { ok: true, docType, review: badLines.length > 0, message: `${lender ? `返済予定表（${lender}）` : '返済予定表'}を登録しました（${count}回分）${warnTxt(badLines)}` };
+  }
+  if (docType === 'payslip' || docType === 'wage_ledger') {
+    const lines: any[] = Array.isArray(doc?.lines) ? doc.lines.filter((l: any) => l && typeof l === 'object') : [];
+    if (lines.length === 0) { await saveUnprocessed({ ...saveCtx, docType }, 'no_payroll_lines_found'); return { ok: false, message: '給与明細から読み取れる項目が見つかりませんでした。' }; }
+    const { count, total, badLines } = await savePayroll(lines, { ...saveCtx, imageHash: fileHash, docType }, docType);
+    const label = docType === 'wage_ledger' ? '賃金台帳' : '給与明細';
+    const b = docType === 'wage_ledger' ? `${count}名分・総支給計¥${total.toLocaleString()}` : `総支給¥${total.toLocaleString()}`;
+    return { ok: true, docType, review: badLines.length > 0, message: `${label}を登録しました（${b}）${warnTxt(badLines)}` };
+  }
+
+  // レシート/領収書/請求書/納付書/残高証明/固定資産/EC入金
+  const receipts: any[] = Array.isArray(doc?.receipts) ? doc.receipts.filter((r: any) => r && typeof r === 'object') : [];
+  if (receipts.length === 0) { await saveUnprocessed({ ...saveCtx, docType }, 'no_receipts_found'); return { ok: false, message: '読み取れる書類が見つかりませんでした。別の写真でお試しください。' }; }
+  const summaries: string[] = [];
+  for (let i = 0; i < receipts.length; i++) {
+    summaries.push(await saveReceipt(receipts[i], { ...saveCtx, imageHash: i === 0 ? fileHash : null, docType }));
+  }
+  const head = receipts.length > 1 ? `登録しました（${receipts.length}件）\n` : '登録しました。\n';
+  return { ok: true, docType, message: head + summaries.join('\n') };
+}
+
+export default async function handler(req: VercelRequest, res: VercelResponse) {
+  if (req.method !== 'POST') return res.status(405).json({ ok: false, message: 'POST only' });
+  const clientId = verifySession(parseCookies(req)[COOKIE]);
+  if (!clientId) return res.status(401).json({ ok: false, message: 'ログインが必要です。' });
+
+  const { data: client } = await supabase
+    .from('clients')
+    .select('id, official_name, office_id')
+    .eq('id', clientId)
+    .single();
+  if (!client) return res.status(401).json({ ok: false, message: '顧問先が見つかりません。' });
+
+  const body: any = req.body ?? {};
+  const dataBase64 = body.dataBase64;
+  const contentType = typeof body.contentType === 'string' ? body.contentType : 'application/octet-stream';
+  const filename = typeof body.filename === 'string' ? body.filename : '';
+  if (!dataBase64 || typeof dataBase64 !== 'string') return res.status(400).json({ ok: false, message: 'ファイルがありません。' });
+
+  let buffer: Buffer;
+  try { buffer = Buffer.from(dataBase64, 'base64'); } catch { return res.status(400).json({ ok: false, message: 'ファイル形式エラー。' }); }
+  if (buffer.length === 0) return res.status(400).json({ ok: false, message: '空のファイルです。' });
+
+  try {
+    const accounts = await loadAccounts(supabase, client.office_id ?? null);
+    const result = await processUpload(buffer, contentType, filename, client, accounts);
+    return res.status(200).json(result);
+  } catch (e) {
+    console.error('upload handler error', e);
+    return res.status(500).json({ ok: false, message: '処理中にエラーが発生しました。時間をおいて再度お試しください。' });
+  }
+}
