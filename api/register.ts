@@ -17,10 +17,6 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 function esc(s: unknown): string {
   return String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c] as string);
 }
-function fm(v: unknown): number | null {
-  const n = Number(String(v ?? '').replace(/[^0-9.-]/g, ''));
-  return !Number.isNaN(n) && n >= 1 && n <= 12 ? Math.round(n) : null;
-}
 async function pushLine(officeId: string | null, toUserId: string, text: string): Promise<void> {
   let token = ENV_LINE_TOKEN;
   if (officeId) {
@@ -61,34 +57,18 @@ function page(): string {
 <div class="wrap"><div class="card">
   <div id="loading">読み込み中…</div>
   <form id="f" style="display:none">
-    <h1>基本情報の登録</h1>
-    <p class="sub">最初に会社の基本情報をご登録ください。決算月などの把握に使います。登録後はこのトークに領収書などを撮って送るだけでOKです。</p>
+    <h1>はじめにご登録</h1>
+    <p class="sub">お名前だけ確認させてください（10秒で完了）。あとはこのトークに領収書などを撮って送るだけでOKです。その他の情報は後から事務所でも編集できます。</p>
     <label>会社名 <span style="color:#dc2626">*</span></label>
     <input name="official_name" required placeholder="株式会社○○">
-    <label>屋号</label>
-    <input name="trade_name" placeholder="任意">
-    <label>担当者名</label>
-    <input name="contact_name">
-    <label>メールアドレス</label>
-    <input name="email" type="email" inputmode="email" autocapitalize="off">
-    <label>携帯電話番号</label>
-    <input name="phone" type="tel" inputmode="tel">
-    <label>営業期間（決算月の把握用）</label>
-    <div class="row2">
-      <div><span style="font-size:.75rem;color:#64748b">期首</span><select name="fiscal_start_month"></select></div>
-      <div><span style="font-size:.75rem;color:#64748b">期末（決算月）</span><select name="fiscal_end_month"></select></div>
-    </div>
+    <label>ご担当者名</label>
+    <input name="contact_name" placeholder="例：山田太郎">
     <button type="submit">この内容で登録する</button>
   </form>
   <div id="done" style="display:none"></div>
 </div></div>
 <script>
   var LIFF_ID='${esc(LIFF_ID)}';
-  // 月セレクト
-  ['fiscal_start_month','fiscal_end_month'].forEach(function(n){
-    var s=document.querySelector('[name='+n+']'); s.innerHTML='<option value="">—</option>';
-    for(var m=1;m<=12;m++){var o=document.createElement('option');o.value=m;o.textContent=m+'月';s.appendChild(o);}
-  });
   function showForm(){document.getElementById('loading').style.display='none';document.getElementById('f').style.display='block';}
   liff.init({liffId:LIFF_ID}).then(function(){
     if(!liff.isLoggedIn()){liff.login();return;}
@@ -99,7 +79,7 @@ function page(): string {
     var btn=this.querySelector('button');btn.disabled=true;btn.textContent='登録中…';
     var data={accessToken:liff.getAccessToken()};
     var f=this;
-    ['official_name','trade_name','contact_name','email','phone','fiscal_start_month','fiscal_end_month'].forEach(function(n){data[n]=(f.elements[n]||{}).value||'';});
+    ['official_name','contact_name'].forEach(function(n){data[n]=(f.elements[n]||{}).value||'';});
     fetch('/api/register',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)})
       .then(function(r){return r.json();})
       .then(function(j){
@@ -147,14 +127,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   const { data: offices } = await supabase.from('offices').select('id').order('office_code', { ascending: true }).limit(1);
   const officeId = offices && offices.length ? offices[0].id : null;
 
+  // LIFFフォームで受けるのは会社名・担当者名のみ。屋号/email/携帯/期首期末は
+  // 管理画面（顧問先側 /api/my?info=1 ・事務所側 /api/dashboard?view=clients）で編集する。
+  // 既存client更新時もこの2項目だけ触り、他で設定済みの値を null 上書きしない。
   const basic = {
     official_name: String(b.official_name ?? '').trim() || '（未設定）',
-    trade_name: String(b.trade_name ?? '').trim() || null,
     contact_name: String(b.contact_name ?? '').trim() || null,
-    email: String(b.email ?? '').trim() || null,
-    phone: String(b.phone ?? '').trim() || null,
-    fiscal_start_month: fm(b.fiscal_start_month),
-    fiscal_end_month: fm(b.fiscal_end_month),
   };
 
   let code = '';
