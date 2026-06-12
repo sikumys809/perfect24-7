@@ -349,12 +349,68 @@ function renderCard(r: Row, d: Awaited<ReturnType<typeof loadData>>, editHref: (
   </div>`;
 }
 
+// 顧問先の基本情報 一覧・編集ページ（事務所側）。保存は /api/settings へ。
+function renderClientsPage(clients: Row[], key: string): string {
+  const keyField = key ? `<input type="hidden" name="key" value="${esc(key)}">` : '';
+  const backQ = key ? `?key=${encodeURIComponent(key)}` : '';
+  const monthOpts = (sel: unknown) =>
+    `<option value="">—</option>` +
+    Array.from({ length: 12 }, (_, i) => i + 1).map((m) => `<option value="${m}"${Number(sel) === m ? ' selected' : ''}>${m}月</option>`).join('');
+  const rows = clients
+    .map(
+      (c) => `<form class="cform" method="post" action="/api/settings">
+      <input type="hidden" name="action" value="saveinfo"><input type="hidden" name="client" value="${esc(c.id)}">${keyField}
+      <div class="ch"><b>${esc(c.client_code)}</b>${c.linked_line_user_id ? '<span class="lk">LINE連携済</span>' : '<span class="nlk">未連携</span>'}</div>
+      <div class="grid">
+        <label>会社名<input name="official_name" value="${esc(c.official_name ?? '')}"></label>
+        <label>屋号<input name="trade_name" value="${esc(c.trade_name ?? '')}"></label>
+        <label>担当者<input name="contact_name" value="${esc(c.contact_name ?? '')}"></label>
+        <label>メール<input name="email" value="${esc(c.email ?? '')}"></label>
+        <label>携帯<input name="phone" value="${esc(c.phone ?? '')}"></label>
+        <label>期首<select name="fiscal_start_month">${monthOpts(c.fiscal_start_month)}</select></label>
+        <label>期末(決算月)<select name="fiscal_end_month">${monthOpts(c.fiscal_end_month)}</select></label>
+      </div>
+      <button type="submit">保存</button>
+    </form>`,
+    )
+    .join('');
+  return `<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>顧問先情報｜パーフェクト24/7</title>
+<style>
+  body{margin:0;background:#f1f5f9;color:#0f172a;font-family:-apple-system,BlinkMacSystemFont,"Hiragino Kaku Gothic ProN","Noto Sans JP",sans-serif;}
+  header{position:sticky;top:0;background:#0f172a;color:#fff;padding:12px 18px;display:flex;align-items:center;gap:14px;}
+  header h1{font-size:1.05rem;margin:0;} header a{color:#cbd5e1;text-decoration:none;font-size:.85rem;margin-left:auto;}
+  .wrap{max-width:900px;margin:0 auto;padding:16px;}
+  .cform{background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:14px;margin-bottom:12px;}
+  .ch{font-size:.95rem;margin-bottom:10px;} .ch b{margin-right:8px;}
+  .lk{color:#047857;background:#d1fae5;font-size:.72rem;font-weight:700;padding:2px 8px;border-radius:999px;}
+  .nlk{color:#92400e;background:#fef3c7;font-size:.72rem;font-weight:700;padding:2px 8px;border-radius:999px;}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;}
+  .grid label{display:flex;flex-direction:column;font-size:.74rem;color:#64748b;font-weight:700;gap:3px;}
+  .grid input,.grid select{font-size:.92rem;padding:7px;border:1px solid #cbd5e1;border-radius:8px;}
+  .cform button{margin-top:10px;font-size:.9rem;font-weight:700;padding:8px 18px;border:none;border-radius:8px;background:#2563eb;color:#fff;cursor:pointer;}
+</style></head><body>
+<header><h1>顧問先 基本情報</h1><a href="/api/dashboard${backQ}">← ダッシュボードへ</a></header>
+<div class="wrap">${clients.length ? rows : '<p>顧問先がありません。</p>'}</div>
+</body></html>`;
+}
+
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   // 簡易アクセス保護
   const keyEnforced = DASHBOARD_KEY.length > 0;
   if (keyEnforced && req.query.key !== DASHBOARD_KEY) {
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
     return res.status(401).send('<!doctype html><meta charset="utf-8"><body style="font-family:sans-serif;padding:2rem">アクセスキーが必要です（?key=...）。</body>');
+  }
+
+  // 顧問先の基本情報 一覧・編集
+  if (req.query.view === 'clients') {
+    const { data: clients } = await supabase
+      .from('clients')
+      .select('id, client_code, official_name, trade_name, contact_name, email, phone, fiscal_start_month, fiscal_end_month, linked_line_user_id')
+      .order('client_code', { ascending: true });
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-store');
+    return res.status(200).send(renderClientsPage(clients ?? [], typeof req.query.key === 'string' ? req.query.key : ''));
   }
 
   let d: Awaited<ReturnType<typeof loadData>>;
@@ -608,6 +664,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   <nav class="reports">
     <a href="${reportHref('trial')}">📊 試算表</a>
     <a href="${reportHref('ledger')}">📒 総勘定元帳</a>
+    <a href="/api/dashboard?view=clients${key ? `&key=${encodeURIComponent(key)}` : ''}">👤 顧問先情報</a>
   </nav>
   <span class="live">● 20秒ごとに自動更新</span>
 </header>

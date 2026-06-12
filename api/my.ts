@@ -122,6 +122,7 @@ const PAGE_HEAD = `<meta charset="utf-8"><meta name="viewport" content="width=de
   .editform button { flex:1; font-size:1rem; font-weight:700; padding:12px; border:none; border-radius:10px; background:#2563eb; color:#fff; }
   .editform a.cancel { flex:0 0 auto; align-self:center; color:var(--muted); text-decoration:none; font-size:.9rem; padding:12px; }
   .editform .note { color:#94a3b8; font-size:.76rem; margin-top:12px; line-height:1.5; }
+  .saved { max-width:520px; margin:10px auto 0; background:#d1fae5; color:#047857; font-weight:700; text-align:center; padding:10px; border-radius:10px; font-size:.9rem; }
   .vendor { font-size:1rem; font-weight:700; }
   .amount { font-size:1.25rem; font-weight:800; margin:2px 0; }
   .date { color:var(--muted); font-size:.8rem; }
@@ -470,6 +471,7 @@ async function renderDashboard(clientId: string, fType: string): Promise<string>
 <header>
   <h1>マイ書類</h1>
   <span class="who">${esc(client.official_name)}</span>
+  <a class="logout" href="/api/my?info=1">基本情報</a>
   <a class="logout" href="/api/my?logout=1">ログアウト</a>
 </header>
 <div class="wrap">
@@ -545,6 +547,49 @@ function renderEditPage(rec: Row, f: Record<string, string>): string {
 </body></html>`;
 }
 
+// 基本情報ページ（顧問先が自分の会社情報を編集）
+function renderInfoPage(c: Row, saved: boolean): string {
+  const monthOpts = (sel: unknown) =>
+    `<option value="">—</option>` +
+    Array.from({ length: 12 }, (_, i) => i + 1)
+      .map((m) => `<option value="${m}"${Number(sel) === m ? ' selected' : ''}>${m}月</option>`)
+      .join('');
+  return `<!doctype html><html lang="ja"><head>${PAGE_HEAD}<title>基本情報｜パーフェクト24/7</title></head><body>
+<header>
+  <h1>基本情報</h1>
+  <a class="logout" href="/api/my">← 一覧へ戻る</a>
+</header>
+<div class="wrap">
+  ${saved ? `<div class="saved">✓ 保存しました</div>` : ''}
+  <form class="editform" method="post" action="/api/my">
+    <input type="hidden" name="action" value="saveinfo">
+    <h2>会社の基本情報</h2>
+    <p class="sub">決算月などの把握に使います。変更があればいつでも直してください。（登録コード: ${esc(c.client_code)}）</p>
+    <label>会社名</label>
+    <input name="official_name" value="${esc(c.official_name ?? '')}" required>
+    <label>屋号</label>
+    <input name="trade_name" value="${esc(c.trade_name ?? '')}" placeholder="任意">
+    <label>担当者名</label>
+    <input name="contact_name" value="${esc(c.contact_name ?? '')}">
+    <label>メールアドレス</label>
+    <input type="email" name="email" value="${esc(c.email ?? '')}" inputmode="email" autocapitalize="off">
+    <label>携帯電話番号</label>
+    <input type="tel" name="phone" value="${esc(c.phone ?? '')}" inputmode="tel">
+    <label>営業期間（決算月の把握用）</label>
+    <div class="row2">
+      <div><label style="font-weight:400;color:#64748b">期首</label><select name="fiscal_start_month">${monthOpts(c.fiscal_start_month)}</select></div>
+      <div><label style="font-weight:400;color:#64748b">期末（決算月）</label><select name="fiscal_end_month">${monthOpts(c.fiscal_end_month)}</select></div>
+    </div>
+    <div class="btns">
+      <a class="cancel" href="/api/my">戻る</a>
+      <button type="submit">保存する</button>
+    </div>
+  </form>
+</div>
+<script>(function(){var f=document.querySelector('.editform');if(f)f.addEventListener('submit',function(){var b=f.querySelector('button[type=submit]');if(b){b.disabled=true;b.textContent='保存中…';b.style.opacity='.7';}});})();</script>
+</body></html>`;
+}
+
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   // ログアウト
   if (req.method === 'GET' && req.query.logout) {
@@ -603,6 +648,39 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       setField(id, 'client_edited', stamp),
     ]);
     return res.redirect(303, '/api/my');
+  }
+
+  // 基本情報の保存（本人の clients 行のみ）
+  if (req.method === 'POST' && req.body?.action === 'saveinfo') {
+    const b = req.body ?? {};
+    const fm = (v: unknown) => {
+      const n = num(v);
+      return n != null && n >= 1 && n <= 12 ? Math.round(n) : null;
+    };
+    await supabase
+      .from('clients')
+      .update({
+        official_name: String(b.official_name ?? '').trim() || '（未設定）',
+        trade_name: String(b.trade_name ?? '').trim() || null,
+        contact_name: String(b.contact_name ?? '').trim() || null,
+        email: String(b.email ?? '').trim() || null,
+        phone: String(b.phone ?? '').trim() || null,
+        fiscal_start_month: fm(b.fiscal_start_month),
+        fiscal_end_month: fm(b.fiscal_end_month),
+      })
+      .eq('id', clientId);
+    return res.redirect(303, '/api/my?info=1&saved=1');
+  }
+
+  // 基本情報ページ
+  if (req.method === 'GET' && req.query.info) {
+    const { data } = await supabase
+      .from('clients')
+      .select('id, client_code, official_name, trade_name, contact_name, email, phone, fiscal_start_month, fiscal_end_month')
+      .eq('id', clientId)
+      .single();
+    if (!data) return res.status(200).send(loginPage('セッションが無効です。'));
+    return res.status(200).send(renderInfoPage(data, !!req.query.saved));
   }
 
   // 編集フォーム表示
