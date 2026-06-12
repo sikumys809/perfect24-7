@@ -218,12 +218,9 @@ async function renderDashboard(clientId: string, fType: string): Promise<string>
   // 今月（JST）の件数・経費/売上累計
   const jst = new Date(Date.now() + 9 * 3600 * 1000);
   const ym = `${jst.getUTCFullYear()}-${String(jst.getUTCMonth() + 1).padStart(2, '0')}`;
+  // 「今月の提出」件数は受信日(created_at)基準＝今月LINEで送った書類の数。
   const thisMonth = meaningful.filter((r) => String(r.created_at).slice(0, 7) === ym);
   const monthCount = thisMonth.length;
-  const sumDir = (dir: string) =>
-    thisMonth.filter((r) => r.direction === dir && r.document_type !== 'bankbook').reduce((s, r) => s + (Number(r.total_amount) || 0), 0);
-  const monthExpense = sumDir('expense');
-  const monthSales = sumDir('sales');
 
   // ───────── 経営の見える化（参考値）─────────
   // 損益に効く書類のみ（通帳・カード・固定資産・残高証明などは二重計上/資産のため除外）。
@@ -231,6 +228,15 @@ async function renderDashboard(clientId: string, fType: string): Promise<string>
   const PNL_TYPES = new Set(['receipt', 'invoice', 'tax_payment', 'ec_payout', 'payslip', 'wage_ledger']);
   const pnl = meaningful.filter((r) => PNL_TYPES.has(r.document_type));
   const monthKey = (r: Row) => String(r.issued_date ?? r.created_at ?? '').slice(0, 7);
+
+  // 今月の売上/経費は「書類の日付(issued_date)」基準で損益対象書類(pnl)から集計。
+  // → 下の「経費の内訳」「月次推移」と同じ基準・同じ対象なので数字が一致する。
+  const monthSales = pnl
+    .filter((r) => r.direction === 'sales' && monthKey(r) === ym)
+    .reduce((s, r) => s + (Number(r.total_amount) || 0), 0);
+  const monthExpense = pnl
+    .filter((r) => r.direction === 'expense' && monthKey(r) === ym)
+    .reduce((s, r) => s + (Number(r.total_amount) || 0), 0);
 
   // 直近6ヶ月の推移
   const months: string[] = [];
