@@ -161,6 +161,29 @@ async function replyLineMessage(accessToken: string, replyToken: string, text: s
   });
 }
 
+// 友達追加・未登録時：LIFF登録フォームへのボタンを返す
+const LIFF_ID = process.env.LIFF_ID || '2010381130-ZERK9yVI';
+async function replyRegisterPrompt(accessToken: string, replyToken: string) {
+  await fetch('https://api.line.me/v2/bot/message/reply', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${accessToken}` },
+    body: JSON.stringify({
+      replyToken,
+      messages: [
+        {
+          type: 'template',
+          altText: 'まず基本情報のご登録をお願いします。',
+          template: {
+            type: 'buttons',
+            text: 'ご利用ありがとうございます。\nまず基本情報のご登録をお願いします。',
+            actions: [{ type: 'uri', label: '📝 基本情報を登録する', uri: `https://liff.line.me/${LIFF_ID}` }],
+          },
+        },
+      ],
+    }),
+  });
+}
+
 // レシート/領収書/請求書/通帳 抽出用プロンプト（日本語・税務用途）
 // 1入力（画像/PDF）に複数枚・複数ページ含まれることがあるため、配列で全件返させる
 const EXTRACTION_PROMPT = `あなたは日本語のレシート・領収書・請求書・銀行通帳（預金通帳）を読み取る専門家です。
@@ -1291,9 +1314,9 @@ async function processWebhookEvents(bodyText: string, ctx: ReqCtx) {
     try {
       const lineUserId = ev?.source?.userId ?? null;
 
-      // 友達追加：登録の案内を返す
+      // 友達追加：LIFF登録フォームへのボタンを返す
       if (ev.type === 'follow') {
-        if (ev.replyToken) await replyLineMessage(ctx.accessToken, ev.replyToken, WELCOME_MESSAGE);
+        if (ev.replyToken) await replyRegisterPrompt(ctx.accessToken, ev.replyToken);
         continue;
       }
 
@@ -1311,7 +1334,7 @@ async function processWebhookEvents(bodyText: string, ctx: ReqCtx) {
       // 書類は登録済み顧問先のみ受付（未登録は登録を促す）
       const client = lineUserId ? await findClientByLineUser(lineUserId, ctx.officeId) : null;
       if (!client) {
-        if (ev.replyToken) await replyLineMessage(ctx.accessToken, ev.replyToken, WELCOME_MESSAGE);
+        if (ev.replyToken) await replyRegisterPrompt(ctx.accessToken, ev.replyToken);
         continue;
       }
 
