@@ -213,7 +213,13 @@ Generated on 2026-06-10
 - **OTPログイン(P3・本番稼働)**: 「コードだけログイン」を廃止。登録コード入力→そのLINEに6桁OTPプッシュ(5分)→OTP入力でCookie。コード→OTPはHMAC署名トークン(client_id+期限)で受け渡し。試行5回で無効化・再送あり。LINEプッシュは事務所トークン→env(LINE_CHANNEL_ACCESS_TOKEN)フォールバック。**LINE未連携のコードは拒否**（OTP届かないため）。
 - **LIFF自己登録(P2・実装済/実機テスト待ち)**: LINEログインチャネル(ID 2010381130)＋LIFF(`2010381130-ZERK9yVI`)。`/api/register` GET=LIFFフォーム(会社名/屋号/担当/email/携帯/期首期末)、POST=登録。LIFF id_token をサーバ検証(client_id=2010381130)し本物のuserId取得→client作成・LINE紐付け→登録コードをLINEプッシュ。既存userIdは更新(重複作成しない)。webhook follow/未登録時の返信を LIFF ボタンに変更。LIFF_ID は env 上書き可。
   - **⚠️重要な検証ポイント**: LINEログインチャネルが Messaging API と**同一プロバイダー**(パーフェクト24/7)ならLINE userIDが一致し、mizuno が登録すると既存シクミーズ(linked_line_user_id=U01bf...)を**更新**する。別プロバイダーだとuserIDが違い**新規重複clientが作られる**→その場合はチャネルを同一プロバイダーで作り直す。
-  - 実機テスト: LINEで `https://liff.line.me/2010381130-ZERK9yVI` を開く（or bot を一度ブロック→再追加でボタン表示）→フォーム送信→コードがLINEに届くか＋重複clientが出ないか確認。
+  - 実機テスト: LINEで LIFF URL を開く→フォーム送信→コードがLINEに届くか＋重複clientが出ないか確認。
   - これで P1(基本情報)＋P2(自己登録)＋P3(OTPログイン) のオンボーディング一式が完成。
+
+### ⚠️ P2 ハマりと現状（2026-06-12 時点・resume最重要）
+- **プロバイダー不一致でuserIDズレ**: 最初のLINEログインチャネル(2010381130)は森下Messaging APIと別プロバイダーにあり、LINE userIDが別空間→登録すると既存C-00001と一致せず**重複C-00002**が作られた（孤立・削除済）。**教訓: LINEログインチャネルは必ずMessaging APIと同一プロバイダー(パーフェクト24/7)で作る**（プロバイダー内の「+新規チャネル作成」から作り、同じグリッドにタイルが並ぶか確認）。
+- **修正済**: 同一プロバイダー内にLINEログインチャネル「登録」を作り直し → 新LIFF `2010381453-fQ4q2Hlc`（チャネルID 2010381453）。コードの LIFF_ID 既定値を更新済（register.ts / line-webhook.ts、env LIFF_ID で上書き可）。
+- **id_token→アクセストークン検証に変更**: getIDToken()がopenid依存で空→400だった。getAccessToken()に変更し、サーバで `/oauth2/v2.1/verify`(client_id一致確認)＋`/v2/profile` で userId取得（profileスコープのみで動く）。
+- **resume（Mac Proで最初にやる）**: LINEで `https://liff.line.me/2010381453-fQ4q2Hlc` を開いて登録テスト → **C-00001が"更新"される（増えない）＋コードがLINEに届く**を確認。OKならオンボーディング完成。まだ400/エラーなら register.ts のトークン検証ログを確認。LINEログインチャネルは「開発中」なのでAdmin(mizuno)はテスト可、広く配布時は「公開」が必要。
 
 *Generated on 2026-06-12*
