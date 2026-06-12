@@ -201,4 +201,10 @@ Generated on 2026-06-10
 - 新: `/api/export` は**種別未選択(すべて)なら全ジャンルのCSVをZIP**で返す（documents.csv/bankbook.csv/petty_cash.csv/credit_card.csv/payroll.csv/inventory.csv/loan_schedule.csv＋README.txt、データのあるものだけ同梱）。列構成がジャンルで違うのでファイル分け。種別タブ選択時は従来どおり単一CSV。jszip 追加（npmパッケージなのでバンドルOK）。ダッシュのボタン表記も「全ジャンルCSV（ZIP）」に切替。
 - 注意: Vercelのデプロイ伝播ラグでpush直後はエッジ間で新旧が混在することがある（数回リロードで安定）。
 
+## 顧問先による内容修正（2026-06-12 続き・本番検証済み・相互扶助）
+- 顧問先ダッシュ(/api/my)から、自分の書類の**事実項目のみ**修正可: 取引先・日付・税込金額・消費税・但し書き。**勘定科目・売上経費の最終判定・確認済みは事務所専用**（仕分け=税理士の判断）。明細行型(通帳/給与等)は対象外。
+- 実装: /api/my に GET `?edit=<id>`(編集フォーム)＋ POST `action=edit`(保存)。新規Function不要。署名Cookie＋`receipts.client_id===session`で本人の書類のみ（他人IDはリダイレクト）。
+- 修正は extracted_fields に `source=client`、`client_edited`=JST時刻を記録。事務所ダッシュに緑「顧問先修正」バッジ。金額編集時 amount=税込−消費税 を再計算。
+- 設計: 「顧問先=事実を直す／事務所=判断を持つ」。顧問先が直すほど事務所が楽＝回収率・二重ロックを深める相互扶助。
+
 *Generated on 2026-06-12*
