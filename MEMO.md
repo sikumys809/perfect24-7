@@ -136,3 +136,42 @@ Generated on 2026-06-10
 - 事務所トークンのDB移行＋暗号化、2社目オンボーディング手順
 
 *Generated on 2026-06-10*
+
+---
+
+# 作業メモ（2026-06-12）— 引き継ぎ（MacBook Pro → Mac Studio へ戻る）
+
+> このセッションは MacBook Pro。**次回は Mac Studio で再開**。すべて main に push 済み・Vercel 本番反映済み。
+> マイグレーション **011→012→013 は本番Supabaseに適用済み**（動作確認済み）。
+
+## 今日やったこと（税理士フィードバック対応 → 顧問先ダッシュまで）
+1. **勘定科目の自動付与＋修正**（migration 011）: 標準科目マスタ `account_titles`（約50科目・BS/PL区分・貸借区分）を新設。書類受信時に科目を自動付与（モデル提案＋種別/キーワード規則）。`receipts.account_code`/`payment_account_code`/`account_source` 追加。012で既存データへ保守的に backfill。
+2. **書類の編集画面** `/api/edit`: 科目・相手科目・売上経費・日付・税込金額・**消費税額・税率・インボイス登録番号・番号・手数料**・取引先・摘要・確認済みを修正可。保存で `account_source='manual'`。ダッシュボードのカードに「✎編集」リンク＋科目バッジ（自動=青/手修正=緑）。
+3. **月次試算表(BS/PL)＋総勘定元帳** `/api/reports?view=trial|ledger&month=YYYY-MM&client=`: 受信書類に付けた科目から**簡易複式の仕訳をその場で導出**して集計。各仕訳は貸借一致＝「借方合計=貸方合計」が整合チェック。期首残高なし＝BSは均衡しない旨を明記。
+4. **税込/税抜 経理方式**（migration 013）: `clients.tax_accounting`（inclusive/exclusive・既定inclusive）＋ `offices.default_tax_accounting`。reports のヘッダーで顧問先ごとに切替（`/api/settings` がPOSTで保存）。税抜は仮払/仮受消費税(1080/2080)を分離。**保存は税込合計＋税額のまま、レポート側で都度導出 → 方式切替に再取込不要**。
+5. **顧問先ダッシュ** `/api/my`（**登録コードでログイン**）: 自分の書類だけ表示（client_idで厳格に絞る）。Cookieは `SUPABASE_KEY` でHMAC署名（HttpOnly/Secure）＝偽造不可。登録コードは正規化（全角→半角・空白/ハイフン除去）。
+6. **顧問先ダッシュに「経営の見える化（参考値）」**: 今月の売上/経費/利益・**今月の経費の科目別内訳**・**直近6ヶ月の推移**。税込概算・「正式な試算表は事務所に」と注記。損益対象は receipt/invoice/tax_payment/ec_payout/payslip/wage_ledger（通帳・カード・固定資産は除外）。
+
+## ⚠️ 重要な技術的ハマり（次回も必ず踏む）
+- **Vercel: `api/` 内のファイル相互 import は実行時に解決されない。** この設定（vercel.json で buildCommand=echo・outputDirectory=public）では各 `.ts` が個別トランスパイルされ兄弟ファイルがバンドルされない。共有モジュール（`api/_lib/...` も `api/lib/...` も）を import すると **FUNCTION_INVOCATION_FAILED でデプロイ後にクラッシュ**する。dashboard だけ無傷だったのは唯一 import していなかったから。
+  - **対策＝各エンドポイントに会計ロジックをインライン**（loadAccounts/autoAccount/deriveEntries を edit・reports・line-webhook に複製）。共有したくなっても今の構成では不可。変える場合はバンドル方式の見直しが要る。
+- **Vercel が push を時々取りこぼす**（連続 push 時に最新コミットが反映されないことがあった）。数分待っても反映されなければ **空コミット `git commit --allow-empty` で再トリガー**すると直る。コード側の問題ではない。
+- 認証なし500 注意: dashboard/reports/edit/export は新カラムを直接 select するので、**マイグレ未適用だと500**。webhook 側は try/catch で握りつぶし済み。
+
+## 本番URL・アクセス
+- 事務所ダッシュ: `/api/dashboard`（ヘッダーに📊試算表・📒総勘定元帳リンク）
+- 試算表/元帳: `/api/reports`、CSV: `/api/export`、書類編集: `/api/edit`、設定: `/api/settings`
+- **顧問先ダッシュ: https://perfect24-7.vercel.app/api/my** （登録コードを入力。例: C-00001=シクミーズ の code は `E824BB`）
+- Serverless Function 数 = 7（Hobby上限12内）
+- `DASHBOARD_KEY` は未設定のまま（事務所側は誰でも閲覧可）。外部に渡す前に必須設定。
+
+## 戦略メモ（今日の気づき）
+- 顧問先が自社の数字を見られる＝事業骨子の「二段ロケット②（可視化で単価UP）」。**事務所が顧問料で提供＝直販ではない**ので戦略に抵触しない。二重ロックが深まる。
+- ただし「**freee不要**」と言い切るのは危険: ①データ完全性（今はLINEで送った分だけ。通帳が写真ベース＝全取引は拾えない）②freeeは申告・請求書発行・給与計算もやる ③精度・期待値（議事録の急所）。→ **当面は「おまけの見える化」、"freee代替"はデータ完全性が上がってからの本命**、という二段構え。
+
+## 再開ポイント（Mac Studio で）
+- 実機で `/api/my` の経営パネルの見え方・数値バランスを確認（調整候補: 科目の出し方・税抜表示切替・期間フィルタ）。
+- 読み取り精度の作り込み（手書き等）は引き続き「後回し」（ユーザー方針）。
+- 候補: 顧問先が毎回コード入力せず済むリンク（LINEリッチメニューに `/api/my`）、事務所「確認済み」ワンタップ、固定資産/EC入金/小口現金の実機検証（前回からの宿題）、`DASHBOARD_KEY` 設定。
+
+*Generated on 2026-06-12*
