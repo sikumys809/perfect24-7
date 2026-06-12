@@ -339,6 +339,7 @@ function renderCard(r: Row, d: Awaited<ReturnType<typeof loadData>>, editHref: (
         ${acctBadge}
         ${client ? `<span class="client">${esc(client.official_name)} <small>${esc(client.client_code)}</small></span>` : ''}
         ${needsReview ? `<span class="review">⚠️ 要確認</span>` : ''}
+        ${fields['client_edited'] ? `<span class="cedit" title="顧問先が${esc(fields['client_edited'])}に修正">顧問先修正</span>` : ''}
         <a class="edit" href="${esc(editHref(r.id))}">✎ 編集</a>
       </div>
       ${body}
@@ -559,6 +560,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   .client { font-size:.85rem; color:var(--muted); }
   .client small { color:#94a3b8; }
   .review { color:#b45309; background:#fef3c7; font-size:.72rem; font-weight:700; padding:2px 8px; border-radius:999px; }
+  .cedit { color:#047857; background:#d1fae5; font-size:.72rem; font-weight:700; padding:2px 8px; border-radius:999px; }
   .acct { color:#3730a3; background:#e0e7ff; font-size:.72rem; font-weight:700; padding:2px 9px; border-radius:999px; }
   .acct.manual { color:#065f46; background:#d1fae5; }
   .edit { margin-left:auto; color:#2563eb; text-decoration:none; font-size:.78rem; font-weight:700; border:1px solid #bfdbfe; padding:2px 9px; border-radius:8px; }

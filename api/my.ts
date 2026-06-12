@@ -110,6 +110,18 @@ const PAGE_HEAD = `<meta charset="utf-8"><meta name="viewport" content="width=de
   .side { font-size:.7rem; font-weight:700; padding:2px 8px; border-radius:999px; }
   .side.sales { color:#047857; background:#d1fae5; } .side.expense { color:#1e40af; background:#dbeafe; }
   .review { color:#b45309; background:#fef3c7; font-size:.7rem; font-weight:700; padding:2px 8px; border-radius:999px; }
+  .cedit { color:#047857; background:#d1fae5; font-size:.7rem; font-weight:700; padding:2px 8px; border-radius:999px; }
+  .editlink { display:inline-block; margin-top:8px; font-size:.82rem; color:#2563eb; text-decoration:none; border:1px solid #bfdbfe; background:#eff6ff; padding:5px 12px; border-radius:9px; }
+  .editform { max-width:520px; margin:8px auto; background:#fff; border:1px solid var(--line); border-radius:14px; padding:18px; }
+  .editform h2 { margin:0 0 4px; font-size:1.1rem; }
+  .editform .sub { color:var(--muted); font-size:.82rem; margin:0 0 14px; }
+  .editform label { display:block; font-size:.82rem; font-weight:700; color:#334155; margin:12px 0 4px; }
+  .editform input, .editform textarea { width:100%; font-size:1rem; padding:10px; border:1px solid #cbd5e1; border-radius:9px; }
+  .editform .row2 { display:flex; gap:10px; } .editform .row2 > div { flex:1; }
+  .editform .btns { display:flex; gap:10px; margin-top:18px; }
+  .editform button { flex:1; font-size:1rem; font-weight:700; padding:12px; border:none; border-radius:10px; background:#2563eb; color:#fff; }
+  .editform a.cancel { flex:0 0 auto; align-self:center; color:var(--muted); text-decoration:none; font-size:.9rem; padding:12px; }
+  .editform .note { color:#94a3b8; font-size:.76rem; margin-top:12px; line-height:1.5; }
   .vendor { font-size:1rem; font-weight:700; }
   .amount { font-size:1.25rem; font-weight:800; margin:2px 0; }
   .date { color:var(--muted); font-size:.8rem; }
@@ -392,6 +404,9 @@ async function renderDashboard(clientId: string, fType: string): Promise<string>
               : `<div class="noimg">画像なし</div>`;
           const who = f['counterparty'] ?? f['vendor'] ?? (LINE_DOC_TYPES.includes(docType) ? DOC_LABEL[docType] : '取引先不明');
           const review = f['needs_review'] === 'true';
+          // 単一金額型のみ顧問先が事実項目を修正できる（明細行型・科目は事務所側）
+          const editable = !LINE_DOC_TYPES.includes(docType) && docType !== 'other';
+          const clientEdited = Boolean(f['client_edited']);
           return `<div class="card">
             <div class="thumb">${thumb}</div>
             <div class="info">
@@ -399,10 +414,12 @@ async function renderDashboard(clientId: string, fType: string): Promise<string>
                 <span class="badge" style="background:${DOC_COLOR[docType] ?? '#6b7280'}">${esc(DOC_LABEL[docType] ?? docType)}</span>
                 ${r.direction && docType !== 'bankbook' ? `<span class="side ${r.direction}">${r.direction === 'sales' ? '売上' : '経費'}</span>` : ''}
                 ${review ? `<span class="review">確認中</span>` : ''}
+                ${clientEdited ? `<span class="cedit">修正済み</span>` : ''}
               </div>
               <div class="vendor">${esc(who)}</div>
               ${r.total_amount != null ? `<div class="amount">${yen(r.total_amount)}</div>` : ''}
               <div class="date">${esc(fmtDate(r.issued_date))}</div>
+              ${editable ? `<a class="editlink" href="/api/my?edit=${esc(r.id)}">✎ 内容を修正</a>` : ''}
             </div>
           </div>`;
         })
@@ -464,6 +481,62 @@ async function renderDashboard(clientId: string, fType: string): Promise<string>
 </body></html>`;
 }
 
+// ───────── 顧問先による内容修正（事実項目のみ） ─────────
+function num(v: unknown): number | null {
+  if (v === null || v === undefined || String(v).trim() === '') return null;
+  const n = Number(String(v).replace(/[^0-9.-]/g, ''));
+  return Number.isNaN(n) ? null : n;
+}
+// extracted_fields の1項目を upsert
+async function setField(receiptId: string, name: string, value: string | null) {
+  const { data } = await supabase
+    .from('extracted_fields')
+    .select('id')
+    .eq('receipt_id', receiptId)
+    .eq('field_name', name)
+    .limit(1);
+  if (data && data.length) {
+    await supabase.from('extracted_fields').update({ field_value: value, source: 'client' }).eq('id', data[0].id);
+  } else if (value !== null && value !== '') {
+    await supabase.from('extracted_fields').insert({ receipt_id: receiptId, field_name: name, field_value: value, source: 'client' });
+  }
+}
+// 顧問先が編集できる書類か（単一金額型のみ。明細行型・other は不可）
+const isClientEditable = (t: string | null | undefined) => !!t && !LINE_DOC_TYPES.includes(t) && t !== 'other';
+
+function renderEditPage(rec: Row, f: Record<string, string>): string {
+  const counterparty = f['counterparty'] ?? f['vendor'] ?? '';
+  return `<!doctype html><html lang="ja"><head>${PAGE_HEAD}<title>内容を修正｜パーフェクト24/7</title></head><body>
+<header>
+  <h1>内容を修正</h1>
+  <a class="logout" href="/api/my">← 一覧へ戻る</a>
+</header>
+<div class="wrap">
+  <form class="editform" method="post" action="/api/my">
+    <input type="hidden" name="action" value="edit">
+    <input type="hidden" name="id" value="${esc(rec.id)}">
+    <h2>${esc(DOC_LABEL[rec.document_type] ?? '書類')}の修正</h2>
+    <p class="sub">読み取りに間違いがあれば直してください。勘定科目など会計の判断は事務所が行います。</p>
+    <label>取引先</label>
+    <input name="counterparty" value="${esc(counterparty)}" autocomplete="off" placeholder="お店・会社名">
+    <label>日付</label>
+    <input type="date" name="issued_date" value="${esc(rec.issued_date ?? '')}">
+    <div class="row2">
+      <div><label>税込金額</label><input type="number" name="total_amount" value="${esc(rec.total_amount ?? '')}" step="1" inputmode="numeric"></div>
+      <div><label>うち消費税</label><input type="number" name="tax_amount" value="${esc(rec.tax_amount ?? '')}" step="1" inputmode="numeric"></div>
+    </div>
+    <label>メモ・但し書き（何の支払いか等）</label>
+    <textarea name="note" rows="2" placeholder="例: ○○社との打合せ">${esc(f['note'] ?? '')}</textarea>
+    <div class="btns">
+      <a class="cancel" href="/api/my">キャンセル</a>
+      <button type="submit">保存する</button>
+    </div>
+    <p class="note">※ 保存すると事務所に「顧問先修正」として伝わります。原本（写真）は変わりません。</p>
+  </form>
+</div>
+</body></html>`;
+}
+
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   // ログアウト
   if (req.method === 'GET' && req.query.logout) {
@@ -489,11 +562,56 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return res.redirect(303, '/api/my');
   }
 
-  // 表示
   const clientId = verify(parseCookies(req)[COOKIE]);
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
   res.setHeader('Cache-Control', 'no-store');
   if (!clientId) return res.status(200).send(loginPage());
+
+  // 顧問先による内容修正の保存（事実項目のみ。科目・確認済みは触らない）
+  if (req.method === 'POST' && req.body?.action === 'edit') {
+    const id = String(req.body?.id ?? '');
+    const { data: own } = await supabase
+      .from('receipts')
+      .select('id, document_type')
+      .eq('id', id)
+      .eq('client_id', clientId) // 必ず本人の書類のみ
+      .limit(1);
+    const rec = own && own.length ? own[0] : null;
+    if (!rec || !isClientEditable(rec.document_type)) return res.redirect(303, '/api/my');
+    const total = num(req.body?.total_amount);
+    const tax = num(req.body?.tax_amount);
+    const net = total != null && tax != null ? total - tax : total;
+    const issued = typeof req.body?.issued_date === 'string' && req.body.issued_date ? req.body.issued_date : null;
+    await supabase
+      .from('receipts')
+      .update({ total_amount: total, tax_amount: tax, amount: net, issued_date: issued, description: req.body?.note || null })
+      .eq('id', id);
+    await setField(id, 'counterparty', String(req.body?.counterparty ?? '').trim() || null);
+    await setField(id, 'note', String(req.body?.note ?? '').trim() || null);
+    await setField(id, 'tax_amount', tax != null ? String(tax) : null);
+    // 「顧問先修正」マーク（事務所側で見える）
+    const stamp = new Date(Date.now() + 9 * 3600 * 1000).toISOString().replace('T', ' ').slice(0, 16);
+    await setField(id, 'client_edited', stamp);
+    return res.redirect(303, '/api/my');
+  }
+
+  // 編集フォーム表示
+  if (req.method === 'GET' && typeof req.query.edit === 'string' && req.query.edit) {
+    const { data: own } = await supabase
+      .from('receipts')
+      .select('id, document_type, total_amount, tax_amount, issued_date, client_id')
+      .eq('id', req.query.edit)
+      .eq('client_id', clientId)
+      .limit(1);
+    const rec = own && own.length ? own[0] : null;
+    if (!rec || !isClientEditable(rec.document_type)) return res.redirect(303, '/api/my');
+    const { data: frows } = await supabase.from('extracted_fields').select('field_name, field_value').eq('receipt_id', rec.id);
+    const f: Record<string, string> = {};
+    for (const x of frows ?? []) f[x.field_name] = x.field_value;
+    return res.status(200).send(renderEditPage(rec, f));
+  }
+
+  // 表示
   const fType = typeof req.query.type === 'string' ? req.query.type : '';
   try {
     return res.status(200).send(await renderDashboard(clientId, fType));
