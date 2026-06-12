@@ -211,6 +211,9 @@ Generated on 2026-06-10
 - **migration 014適用済**: clients に trade_name/contact_name/email/phone/fiscal_start_month/fiscal_end_month(決算月)＋OTP用(otp_code/otp_expires/otp_attempts)。
 - **基本情報編集(P1)**: 顧問先側 /api/my?info=1（本人のみ）／事務所側 /api/dashboard?view=clients（保存は /api/settings の action=saveinfo）。両方で会社名/屋号/担当/email/携帯/期首期末を編集。
 - **OTPログイン(P3・本番稼働)**: 「コードだけログイン」を廃止。登録コード入力→そのLINEに6桁OTPプッシュ(5分)→OTP入力でCookie。コード→OTPはHMAC署名トークン(client_id+期限)で受け渡し。試行5回で無効化・再送あり。LINEプッシュは事務所トークン→env(LINE_CHANNEL_ACCESS_TOKEN)フォールバック。**LINE未連携のコードは拒否**（OTP届かないため）。
-- **resume: P2 = LIFF登録フォーム未実装**。要・ユーザーのLINE設定（LINEログインチャネル＋LIFFアプリ作成、エンドポイント /api/register、scope profile）→ LIFF IDをもらってから実装。follow時にLIFFリンクを返信→フォーム入力→client作成・LINE紐付け→登録コードをプッシュ、の流れ。
+- **LIFF自己登録(P2・実装済/実機テスト待ち)**: LINEログインチャネル(ID 2010381130)＋LIFF(`2010381130-ZERK9yVI`)。`/api/register` GET=LIFFフォーム(会社名/屋号/担当/email/携帯/期首期末)、POST=登録。LIFF id_token をサーバ検証(client_id=2010381130)し本物のuserId取得→client作成・LINE紐付け→登録コードをLINEプッシュ。既存userIdは更新(重複作成しない)。webhook follow/未登録時の返信を LIFF ボタンに変更。LIFF_ID は env 上書き可。
+  - **⚠️重要な検証ポイント**: LINEログインチャネルが Messaging API と**同一プロバイダー**(パーフェクト24/7)ならLINE userIDが一致し、mizuno が登録すると既存シクミーズ(linked_line_user_id=U01bf...)を**更新**する。別プロバイダーだとuserIDが違い**新規重複clientが作られる**→その場合はチャネルを同一プロバイダーで作り直す。
+  - 実機テスト: LINEで `https://liff.line.me/2010381130-ZERK9yVI` を開く（or bot を一度ブロック→再追加でボタン表示）→フォーム送信→コードがLINEに届くか＋重複clientが出ないか確認。
+  - これで P1(基本情報)＋P2(自己登録)＋P3(OTPログイン) のオンボーディング一式が完成。
 
 *Generated on 2026-06-12*
