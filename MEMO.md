@@ -223,3 +223,44 @@ Generated on 2026-06-10
 - **resume（Mac Proで最初にやる）**: LINEで `https://liff.line.me/2010381453-fQ4q2Hlc` を開いて登録テスト → **C-00001が"更新"される（増えない）＋コードがLINEに届く**を確認。OKならオンボーディング完成。まだ400/エラーなら register.ts のトークン検証ログを確認。LINEログインチャネルは「開発中」なのでAdmin(mizuno)はテスト可、広く配布時は「公開」が必要。
 
 *Generated on 2026-06-12*
+
+---
+
+# 作業メモ（2026-06-13）— 引き継ぎ（事務所ログイン・メール再設定・複数法人）
+
+> このセッションは Mac Studio。すべて main に push 済み・Vercel 本番反映済み。**マイグレーション 016 まで適用済み**。
+
+## 今日やったこと（すべて本番稼働）
+1. **勘定科目→試算表/元帳・期間絞り（前段）** に続き、**ホワイトラベル**: 顧問先ダッシュ(/api/my)の左上に「〇〇税理士事務所 記帳システム」、事務所ダッシュに「⚡パーフェクト24/7」ロゴ。
+2. **事務所ダッシュに期間絞り**（/api/dashboard・/api/export）: 月／任意期間(from/to)／**事業年度**（顧問先の決算月 fiscal_end_month から自動）。
+3. **事務所ログイン（マルチテナント認証）**（migration 015・/api/office）: メール+パスワード(scrypt)、自己登録→承認(pending→active)、初回ログインでパスワード設定。全事務所エンドポイント(dashboard/reports/edit/export/settings)に**ゲート＋office_idスコープ＋所有チェック**。**ただし env `OFFICE_AUTH=on` の時だけ有効**。**現状OFF**＝森下テスト運用を止めないため。
+4. **パスワード再設定（セルフ・メール）**: 「お忘れの方」→登録メールに30分有効リンク(Resend)→新パスワード設定。トークンはステートレス署名（現password_hashを鍵に混ぜ実質ワンタイム）。本人パスワード変更（ログイン中）＋運営リセット（`ADMIN_KEY`）も実装。
+5. **Resend導入＋ドメイン認証完了**: `sikumys.co.jp` をResendで認証（ConoHaのDNSにDKIM/SPF(send)/MX(send)/DMARC追加・検証Verified）。`noreply@sikumys.co.jp` から任意宛先に送信OK。
+6. **1 LINE = 複数法人**（migration 016・webhook）: 同一LINEに複数会社を許可（一意制約撤去）＋`line_sender_state`。**1社は従来どおり（プロンプト無し＝回帰なし）**、2社以上は**アクティブ会社に登録＋送信直後に「別会社に変更」クイックリプライ(postback)**＋テキスト「切替」。登録コードで2社目以降を追加。
+
+## 環境変数（Vercel）の状態
+- **設定済み**: `RESEND_API_KEY` / `MAIL_FROM=パーフェクト24/7 <noreply@sikumys.co.jp>` / `APP_ORIGIN=https://perfect24-7.vercel.app`
+- **未設定（必要時に入れる）**:
+  - `OFFICE_AUTH=on` … 入れると事務所ログイン必須＋データ分離が有効化（**まだ入れていない**。森下が一通り検証してからON）
+  - `ADMIN_KEY` … 運営パスワードリセット(/api/office?admin=1)に必要
+
+## 事務所(office#1)ログイン情報
+- O-001 森下敦史税理士事務所 / email: `morishita@morishita-zeimu.com` / pass: `morishita-zeimu`（scrypt保存）
+
+## ⚠️ 不変の技術制約（再掲）
+- **Vercel: api/ 内のファイル相互 import は実行時に解決されない** → 会計ロジック・officeSession等は各エンドポイントにインライン複製。
+- Vercelが稀にpush取りこぼし → 空コミットで再トリガー。
+- 事務所側エンドポイントは新カラム直参照のため**マイグレ未適用だと500**（webhookはtry握りつぶし）。
+
+## 状態・データ
+- **顧問先・書類は全削除済み（クリーンスレート）**。offices(1)・account_titles(60)は保持。
+- マイグレーション適用: **001〜016 すべて適用済み**。
+- Serverless Function 数 = 11（office追加。Hobby上限12内）。
+
+## 再開ポイント（ここから）
+- **本番オンボーディングのテスト中**: 顧問先が森下公式LINEを友達追加(follow)→LIFF登録フォーム(会社名・担当者名)→コード→書類送信、の本番フローを検証する。followを再発火させるにはLINEで一度ブロック→解除。
+- **②LIFFのDB化（未完）**: 事務所ごとLIFF。`offices.liff_id` 列は用意済み。register.ts を `?office=` で事務所解決→DBのliff_idでinit、に変更（後方互換でenv既定フォールバック）。2社目オンボーディング直前にやる。
+- **複数法人の自己登録（未完）**: 本番フローだとLIFFは1社しか作れない（再submitは既存更新）。顧問先が自分で2社目を作る「会社を追加」ボタン（LIFF or /api/my）を足すと本物の自己完結になる。②とまとめて。
+- 任意: `OFFICE_AUTH=on` 有効化＋見え方確認、専用サービスドメイン取得時に `MAIL_FROM` 差替え。
+
+*Generated on 2026-06-13*
