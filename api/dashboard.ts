@@ -1,5 +1,28 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
+import crypto from 'node:crypto';
 import { createClient } from '@supabase/supabase-js';
+
+// 事務所ログイン（OFFICE_AUTH=on で有効）。OFF の間は従来どおり開く＝既存挙動を壊さない。
+// 共有モジュール import は Vercel で解決されないため、セッション検証は各エンドポイントにインライン。
+const OFFICE_AUTH = process.env.OFFICE_AUTH === 'on';
+function officeSession(req: VercelRequest): string | null {
+  const raw = req.headers.cookie;
+  if (!raw) return null;
+  let val: string | undefined;
+  for (const part of raw.split(';')) {
+    const i = part.indexOf('=');
+    if (i > 0 && part.slice(0, i).trim() === 'p247_office') val = decodeURIComponent(part.slice(i + 1).trim());
+  }
+  if (!val) return null;
+  const j = val.lastIndexOf('.');
+  if (j < 0) return null;
+  const id = val.slice(0, j);
+  const sig = val.slice(j + 1);
+  const exp = crypto.createHmac('sha256', process.env.SUPABASE_KEY ?? '').update(id).digest('base64url');
+  const a = Buffer.from(sig);
+  const b = Buffer.from(exp);
+  return a.length === b.length && crypto.timingSafeEqual(a, b) ? id : null;
+}
 
 // 事務所向けの読み取り専用ダッシュボード。
 // LINE で届いた書類が「整理済み」で並ぶ様子をその場で見せるための簡易ビュー。
@@ -81,11 +104,12 @@ function fyRange(end: number, offset: number): { from: string; to: string; label
 
 type Row = Record<string, any>;
 
-async function loadData(period?: { from: string; to: string }) {
+async function loadData(period?: { from: string; to: string }, officeId?: string | null) {
   // 期間指定があれば issued_date で範囲抽出、無ければ最新100件
   let rq = supabase
     .from('receipts')
     .select('id, document_type, direction, total_amount, tax_amount, amount, issued_date, created_at, client_id, office_id, account_code, payment_account_code, account_source');
+  if (officeId) rq = rq.eq('office_id', officeId); // 自分の事務所のデータのみ
   rq = period
     ? rq.gte('issued_date', period.from).lte('issued_date', period.to).order('issued_date', { ascending: false }).limit(1000)
     : rq.order('created_at', { ascending: false }).limit(100);
@@ -414,19 +438,28 @@ function renderClientsPage(clients: Row[], key: string): string {
 }
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
-  // 簡易アクセス保護
-  const keyEnforced = DASHBOARD_KEY.length > 0;
+  // 事務所ログイン（OFFICE_AUTH=on のとき必須）。未ログインはログイン画面へ。
+  const officeId = officeSession(req);
+  if (OFFICE_AUTH && !officeId) {
+    res.setHeader('Location', '/api/office');
+    return res.status(302).end();
+  }
+
+  // 簡易アクセス保護（OFFICE_AUTH OFF の移行期のみ。ログイン有効時は不要）
+  const keyEnforced = !OFFICE_AUTH && DASHBOARD_KEY.length > 0;
   if (keyEnforced && req.query.key !== DASHBOARD_KEY) {
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
     return res.status(401).send('<!doctype html><meta charset="utf-8"><body style="font-family:sans-serif;padding:2rem">アクセスキーが必要です（?key=...）。</body>');
   }
 
-  // 顧問先の基本情報 一覧・編集
+  // 顧問先の基本情報 一覧・編集（自分の事務所の顧問先のみ）
   if (req.query.view === 'clients') {
-    const { data: clients } = await supabase
+    let cq = supabase
       .from('clients')
-      .select('id, client_code, official_name, trade_name, contact_name, email, phone, fiscal_start_month, fiscal_end_month, linked_line_user_id')
+      .select('id, client_code, official_name, trade_name, contact_name, email, phone, fiscal_start_month, fiscal_end_month, linked_line_user_id, office_id')
       .order('client_code', { ascending: true });
+    if (officeId) cq = cq.eq('office_id', officeId);
+    const { data: clients } = await cq;
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
     res.setHeader('Cache-Control', 'no-store');
     return res.status(200).send(renderClientsPage(clients ?? [], typeof req.query.key === 'string' ? req.query.key : ''));
@@ -459,7 +492,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
   let d: Awaited<ReturnType<typeof loadData>>;
   try {
-    d = await loadData(period);
+    d = await loadData(period, officeId);
   } catch (err) {
     console.error('dashboard load error', err);
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
@@ -742,6 +775,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     <a href="${reportHref('trial')}">📊 試算表</a>
     <a href="${reportHref('ledger')}">📒 総勘定元帳</a>
     <a href="/api/dashboard?view=clients${key ? `&key=${encodeURIComponent(key)}` : ''}">👤 顧問先情報</a>
+    ${officeId ? `<a href="/api/office?logout=1">ログアウト</a>` : ''}
   </nav>
   <span class="live">● 20秒ごとに自動更新</span>
 </header>

@@ -1,5 +1,26 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
+import crypto from 'node:crypto';
 import { createClient } from '@supabase/supabase-js';
+
+// 事務所ログイン（OFFICE_AUTH=on で有効）。共有不可のため各エンドポイントにインライン。
+const OFFICE_AUTH = process.env.OFFICE_AUTH === 'on';
+function officeSession(req: VercelRequest): string | null {
+  const raw = req.headers.cookie;
+  if (!raw) return null;
+  let val: string | undefined;
+  for (const part of raw.split(';')) {
+    const i = part.indexOf('=');
+    if (i > 0 && part.slice(0, i).trim() === 'p247_office') val = decodeURIComponent(part.slice(i + 1).trim());
+  }
+  if (!val) return null;
+  const j = val.lastIndexOf('.');
+  if (j < 0) return null;
+  const id = val.slice(0, j);
+  const exp = crypto.createHmac('sha256', process.env.SUPABASE_KEY ?? '').update(id).digest('base64url');
+  const a = Buffer.from(val.slice(j + 1));
+  const b = Buffer.from(exp);
+  return a.length === b.length && crypto.timingSafeEqual(a, b) ? id : null;
+}
 
 // 注意: この Vercel 設定では api/ 内の相互 import が実行時に解決されない（各ファイルが個別
 // トランスパイルされ兄弟ファイルがバンドルされない）ため、会計ロジックはここにインラインで持つ。
@@ -156,7 +177,12 @@ function currentMonthJst(): string {
 type Posting = JournalLine & { contra: string };
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
-  if (DASHBOARD_KEY.length > 0 && req.query.key !== DASHBOARD_KEY) {
+  const authOfficeId = officeSession(req);
+  if (OFFICE_AUTH && !authOfficeId) {
+    res.setHeader('Location', '/api/office');
+    return res.status(302).end();
+  }
+  if (!OFFICE_AUTH && DASHBOARD_KEY.length > 0 && req.query.key !== DASHBOARD_KEY) {
     return res.status(401).send('アクセスキーが必要です（?key=...）。');
   }
 
@@ -177,6 +203,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     .lt('issued_date', monthEnd)
     .in('document_type', [...JOURNAL_DOC_TYPES])
     .order('issued_date', { ascending: true });
+  if (authOfficeId) q = q.eq('office_id', authOfficeId); // 自分の事務所のみ
   if (fClient) q = q.eq('client_id', fClient);
   const { data: receipts } = await q;
   const recs = receipts ?? [];

@@ -1,6 +1,27 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
+import crypto from 'node:crypto';
 import { createClient } from '@supabase/supabase-js';
 import JSZip from 'jszip';
+
+// 事務所ログイン（OFFICE_AUTH=on で有効）。共有不可のため各エンドポイントにインライン。
+const OFFICE_AUTH = process.env.OFFICE_AUTH === 'on';
+function officeSession(req: VercelRequest): string | null {
+  const raw = req.headers.cookie;
+  if (!raw) return null;
+  let val: string | undefined;
+  for (const part of raw.split(';')) {
+    const i = part.indexOf('=');
+    if (i > 0 && part.slice(0, i).trim() === 'p247_office') val = decodeURIComponent(part.slice(i + 1).trim());
+  }
+  if (!val) return null;
+  const j = val.lastIndexOf('.');
+  if (j < 0) return null;
+  const id = val.slice(0, j);
+  const exp = crypto.createHmac('sha256', process.env.SUPABASE_KEY ?? '').update(id).digest('base64url');
+  const a = Buffer.from(val.slice(j + 1));
+  const b = Buffer.from(exp);
+  return a.length === b.length && crypto.timingSafeEqual(a, b) ? id : null;
+}
 
 // ダッシュボードと同じ絞り込み（type/client/q）で証憑データを CSV 出力する。
 // 種別を選べばその単一CSV、未選択(すべて)なら全ジャンルのCSVをZIPでまとめて出す。
@@ -41,7 +62,12 @@ function fmtDate(d: unknown): string {
 }
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
-  if (DASHBOARD_KEY.length > 0 && req.query.key !== DASHBOARD_KEY) {
+  const officeId = officeSession(req);
+  if (OFFICE_AUTH && !officeId) {
+    res.setHeader('Location', '/api/office');
+    return res.status(302).end();
+  }
+  if (!OFFICE_AUTH && DASHBOARD_KEY.length > 0 && req.query.key !== DASHBOARD_KEY) {
     return res.status(401).send('アクセスキーが必要です（?key=...）。');
   }
 
@@ -65,6 +91,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   q = pFrom && pTo
     ? q.gte('issued_date', pFrom).lte('issued_date', pTo).order('issued_date', { ascending: false }).limit(2000)
     : q.order('created_at', { ascending: false }).limit(500);
+  if (officeId) q = q.eq('office_id', officeId); // 自分の事務所のみ
   if (fType) q = q.eq('document_type', fType);
   if (fDir) q = q.eq('direction', fDir);
   if (fClient) q = q.eq('client_id', fClient);

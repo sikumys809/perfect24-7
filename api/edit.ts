@@ -1,8 +1,29 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
+import crypto from 'node:crypto';
 import { createClient } from '@supabase/supabase-js';
 // 注意: このプロジェクトの Vercel 設定では api/ 内の相互 import が実行時に解決されない
 // （各ファイルが個別トランスパイルされ、兄弟ファイルがバンドルされない）ため、
 // 必要なロジックはこのファイル内にインラインで持つ。
+
+// 事務所ログイン（OFFICE_AUTH=on で有効）
+const OFFICE_AUTH = process.env.OFFICE_AUTH === 'on';
+function officeSession(req: VercelRequest): string | null {
+  const raw = req.headers.cookie;
+  if (!raw) return null;
+  let val: string | undefined;
+  for (const part of raw.split(';')) {
+    const i = part.indexOf('=');
+    if (i > 0 && part.slice(0, i).trim() === 'p247_office') val = decodeURIComponent(part.slice(i + 1).trim());
+  }
+  if (!val) return null;
+  const j = val.lastIndexOf('.');
+  if (j < 0) return null;
+  const id = val.slice(0, j);
+  const exp = crypto.createHmac('sha256', process.env.SUPABASE_KEY ?? '').update(id).digest('base64url');
+  const a = Buffer.from(val.slice(j + 1));
+  const b = Buffer.from(exp);
+  return a.length === b.length && crypto.timingSafeEqual(a, b) ? id : null;
+}
 type Account = {
   code: string;
   name: string;
@@ -90,7 +111,13 @@ function num(v: unknown): number | null {
 }
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
-  const keyEnforced = DASHBOARD_KEY.length > 0;
+  const officeId = officeSession(req);
+  if (OFFICE_AUTH && !officeId) {
+    if (req.method === 'POST') return res.status(401).send('ログインが必要です。');
+    res.setHeader('Location', '/api/office');
+    return res.status(302).end();
+  }
+  const keyEnforced = !OFFICE_AUTH && DASHBOARD_KEY.length > 0;
   const key = (req.method === 'POST' ? req.body?.key : req.query.key) ?? '';
   if (keyEnforced && key !== DASHBOARD_KEY) {
     return res.status(401).send('アクセスキーが必要です（?key=...）。');
@@ -101,6 +128,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const b = req.body ?? {};
     const id = String(b.id ?? '');
     if (!id) return res.status(400).send('id が必要です。');
+
+    // 所有チェック: 他事務所の書類は編集不可
+    if (officeId) {
+      const { data: own } = await supabase.from('receipts').select('office_id').eq('id', id).single();
+      if (!own || own.office_id !== officeId) return res.status(403).send('この書類を編集する権限がありません。');
+    }
 
     const direction = b.direction === 'sales' || b.direction === 'expense' ? b.direction : null;
     const total = num(b.total_amount);
@@ -149,6 +182,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     supabase.from('extracted_fields').select('field_name, field_value').eq('receipt_id', id),
   ]);
   if (!rec) return res.status(404).send('書類が見つかりません。');
+  if (officeId && rec.office_id !== officeId) return res.status(404).send('書類が見つかりません。');
 
   const fields: Record<string, string> = {};
   for (const f of fieldsRes.data ?? []) fields[f.field_name] = f.field_value;
