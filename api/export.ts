@@ -1,8 +1,9 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 import { createClient } from '@supabase/supabase-js';
+import JSZip from 'jszip';
 
 // ダッシュボードと同じ絞り込み（type/client/q）で証憑データを CSV 出力する。
-// 「読み取った内容をそのまま会計ソフトに取り込む」導線のデモ用。
+// 種別を選べばその単一CSV、未選択(すべて)なら全ジャンルのCSVをZIPでまとめて出す。
 export const config = { maxDuration: 30 };
 
 const SUPABASE_URL = (process.env.SUPABASE_URL ?? '').replace(/\/rest\/v1\/?$/, '');
@@ -10,11 +11,14 @@ const SUPABASE_KEY = process.env.SUPABASE_KEY ?? '';
 const DASHBOARD_KEY = process.env.DASHBOARD_KEY ?? '';
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
+// 明細行型（document-level CSV からは除外し、専用CSVで出す）
+const LINE_TYPES = ['bankbook', 'petty_cash', 'credit_card', 'inventory', 'loan_schedule', 'payslip', 'wage_ledger'];
+
 const DOC_LABEL: Record<string, string> = {
-  receipt: '領収書',
-  invoice: '請求書',
-  bankbook: '通帳',
-  other: 'その他',
+  receipt: '領収書', invoice: '請求書', bankbook: '通帳', credit_card: 'カード明細',
+  tax_payment: '納付書', balance_certificate: '残高証明', inventory: '棚卸表',
+  loan_schedule: '返済予定表', payslip: '給与明細', wage_ledger: '賃金台帳',
+  fixed_asset: '固定資産', ec_payout: 'EC入金', petty_cash: '小口現金', other: 'その他',
 };
 
 type Row = Record<string, any>;
@@ -126,104 +130,17 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     ? meaningful.filter((r) => String(fieldsByRec[r.id]?.['vendor'] ?? '').toLowerCase().includes(fq))
     : meaningful;
 
-  let csv: string;
-  let fname: string;
-
-  if (fType === 'bankbook' || fType === 'petty_cash') {
-    // 通帳・小口現金は明細1行=1レコードで出力
-    const header = ['受信日時', '顧問先ID', '顧問先', '帳簿ID', '行', '取引日', '摘要', '出金/支払', '入金/受入', '残高', '要確認'];
-    const body: (string | number | null)[][] = [];
-    for (const r of filtered) {
-      const review = fieldsByRec[r.id]?.['needs_review'] === 'true' ? '要確認' : '';
-      for (const t of txnByRec[r.id] ?? []) {
-        body.push([
-          jst(r.created_at), clientCode(r), clientName(r), String(r.id).slice(0, 8),
-          t.line_no, fmtDate(t.txn_date), t.description ?? '',
-          t.withdrawal ?? '', t.deposit ?? '', t.balance ?? '', review,
-        ]);
-      }
-    }
-    csv = toCsv([header, ...body]);
-    fname = fType;
-  } else if (fType === 'credit_card') {
-    // カード明細は利用1行=1レコードで出力
-    const header = ['受信日時', '顧問先ID', '顧問先', 'カード', '明細ID', '行', '利用日', '利用先', '金額', '要確認'];
-    const body: (string | number | null)[][] = [];
-    for (const r of filtered) {
-      const review = fieldsByRec[r.id]?.['needs_review'] === 'true' ? '要確認' : '';
-      const card = fieldsByRec[r.id]?.['vendor'] ?? '';
-      for (const t of txnByRec[r.id] ?? []) {
-        body.push([
-          jst(r.created_at), clientCode(r), clientName(r), card, String(r.id).slice(0, 8),
-          t.line_no, fmtDate(t.txn_date), t.description ?? '', t.withdrawal ?? '', review,
-        ]);
-      }
-    }
-    csv = toCsv([header, ...body]);
-    fname = 'credit_card';
-  } else if (fType === 'inventory') {
-    // 棚卸表は品目1行=1レコードで出力
-    const header = ['受信日時', '顧問先ID', '顧問先', '棚卸ID', '行', '品名', '数量', '単価', '金額', '要確認'];
-    const body: (string | number | null)[][] = [];
-    for (const r of filtered) {
-      const review = fieldsByRec[r.id]?.['needs_review'] === 'true' ? '要確認' : '';
-      for (const l of lineByRec[r.id] ?? []) {
-        body.push([
-          jst(r.created_at), clientCode(r), clientName(r), String(r.id).slice(0, 8),
-          l.line_no, l.label ?? '', l.quantity ?? '', l.unit_price ?? '', l.amount ?? '', review,
-        ]);
-      }
-    }
-    csv = toCsv([header, ...body]);
-    fname = 'inventory';
-  } else if (fType === 'loan_schedule') {
-    // 借入金返済予定表は返済1回=1レコードで出力
-    const header = ['受信日時', '顧問先ID', '顧問先', '借入先', '返済表ID', '回', '返済日', '返済額', '元金', '利息', '残高', '要確認'];
-    const body: (string | number | null)[][] = [];
-    for (const r of filtered) {
-      const review = fieldsByRec[r.id]?.['needs_review'] === 'true' ? '要確認' : '';
-      const lender = fieldsByRec[r.id]?.['vendor'] ?? '';
-      for (const l of lineByRec[r.id] ?? []) {
-        body.push([
-          jst(r.created_at), clientCode(r), clientName(r), lender, String(r.id).slice(0, 8),
-          l.label ?? '', fmtDate(l.line_date), l.amount ?? '', l.principal ?? '', l.interest ?? '', l.balance ?? '', review,
-        ]);
-      }
-    }
-    csv = toCsv([header, ...body]);
-    fname = 'loan_schedule';
-  } else if (fType === 'payslip' || fType === 'wage_ledger') {
-    // 給与は従業員1名=1レコードで出力（支給/控除の内訳つき）
-    const header = ['受信日時', '顧問先ID', '顧問先', '給与ID', '行', '従業員', '支給月', '総支給', '健康保険', '厚生年金', '雇用保険', '源泉所得税', '住民税', 'その他控除', '控除合計', '差引支給', '要確認'];
-    const body: (string | number | null)[][] = [];
-    for (const r of filtered) {
-      const review = fieldsByRec[r.id]?.['needs_review'] === 'true' ? '要確認' : '';
-      for (const p of payByRec[r.id] ?? []) {
-        body.push([
-          jst(r.created_at), clientCode(r), clientName(r), String(r.id).slice(0, 8),
-          p.line_no, p.employee ?? '', p.pay_month ?? '', p.gross ?? '', p.health_insurance ?? '',
-          p.pension ?? '', p.employment_insurance ?? '', p.income_tax ?? '', p.resident_tax ?? '',
-          p.other_deduction ?? '', p.total_deduction ?? '', p.net ?? '', review,
-        ]);
-      }
-    }
-    csv = toCsv([header, ...body]);
-    fname = fType;
-  } else {
-    // 領収書・請求書（および種別未指定の通帳以外）
+  const reviewOf = (r: Row) => (fieldsByRec[r.id]?.['needs_review'] === 'true' ? '要確認' : '');
+  // 各ジャンルのCSVを作る（データが無ければ null）。列構成が違うのでジャンルごとに別ファイル。
+  function buildDocuments(): string | null {
     const header = [
       '受信日時', '顧問先ID', '顧問先', '売上経費', '勘定科目', '種別', '日付', '取引先', '発行元', '宛名',
       '税込金額', '消費税', '手数料', '入金額', '税率', '税目', '対象期間', '資産名', '資産区分', '耐用年数',
       '登録番号', '番号', '但し書き', '要確認', '検算メモ',
     ];
     const dirLabel = (dir: unknown) => (dir === 'sales' ? '売上' : dir === 'expense' ? '経費' : '');
-    const body = filtered
-      .filter(
-        (r) =>
-          !['bankbook', 'petty_cash', 'credit_card', 'inventory', 'loan_schedule', 'payslip', 'wage_ledger'].includes(
-            r.document_type as string,
-          ),
-      )
+    const rows = filtered
+      .filter((r) => !LINE_TYPES.includes(r.document_type as string))
       .map((r) => {
         const f = fieldsByRec[r.id] ?? {};
         return [
@@ -234,15 +151,97 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           r.total_amount ?? '', r.tax_amount ?? '', f['fee'] ?? '', f['net_amount'] ?? '', f['tax_rate'] ?? '',
           f['tax_kind'] ?? '', f['period'] ?? '', f['asset_name'] ?? '', f['asset_category'] ?? '', f['useful_life'] ?? '',
           f['registration_number'] ?? '', f['receipt_no'] ?? '', f['note'] ?? '',
-          f['needs_review'] === 'true' ? '要確認' : '', f['validation_notes'] ?? '',
+          reviewOf(r), f['validation_notes'] ?? '',
         ];
       });
-    csv = toCsv([header, ...body]);
-    fname = fType || 'receipts';
+    return rows.length ? toCsv([header, ...rows]) : null;
+  }
+  function buildLedger(type: string): string | null {
+    const header = ['受信日時', '顧問先ID', '顧問先', '帳簿ID', '行', '取引日', '摘要', '出金/支払', '入金/受入', '残高', '要確認'];
+    const body: (string | number | null)[][] = [];
+    for (const r of filtered.filter((r) => r.document_type === type))
+      for (const t of txnByRec[r.id] ?? [])
+        body.push([jst(r.created_at), clientCode(r), clientName(r), String(r.id).slice(0, 8), t.line_no, fmtDate(t.txn_date), t.description ?? '', t.withdrawal ?? '', t.deposit ?? '', t.balance ?? '', reviewOf(r)]);
+    return body.length ? toCsv([header, ...body]) : null;
+  }
+  function buildCard(): string | null {
+    const header = ['受信日時', '顧問先ID', '顧問先', 'カード', '明細ID', '行', '利用日', '利用先', '金額', '要確認'];
+    const body: (string | number | null)[][] = [];
+    for (const r of filtered.filter((r) => r.document_type === 'credit_card'))
+      for (const t of txnByRec[r.id] ?? [])
+        body.push([jst(r.created_at), clientCode(r), clientName(r), fieldsByRec[r.id]?.['vendor'] ?? '', String(r.id).slice(0, 8), t.line_no, fmtDate(t.txn_date), t.description ?? '', t.withdrawal ?? '', reviewOf(r)]);
+    return body.length ? toCsv([header, ...body]) : null;
+  }
+  function buildInventory(): string | null {
+    const header = ['受信日時', '顧問先ID', '顧問先', '棚卸ID', '行', '品名', '数量', '単価', '金額', '要確認'];
+    const body: (string | number | null)[][] = [];
+    for (const r of filtered.filter((r) => r.document_type === 'inventory'))
+      for (const l of lineByRec[r.id] ?? [])
+        body.push([jst(r.created_at), clientCode(r), clientName(r), String(r.id).slice(0, 8), l.line_no, l.label ?? '', l.quantity ?? '', l.unit_price ?? '', l.amount ?? '', reviewOf(r)]);
+    return body.length ? toCsv([header, ...body]) : null;
+  }
+  function buildLoan(): string | null {
+    const header = ['受信日時', '顧問先ID', '顧問先', '借入先', '返済表ID', '回', '返済日', '返済額', '元金', '利息', '残高', '要確認'];
+    const body: (string | number | null)[][] = [];
+    for (const r of filtered.filter((r) => r.document_type === 'loan_schedule'))
+      for (const l of lineByRec[r.id] ?? [])
+        body.push([jst(r.created_at), clientCode(r), clientName(r), fieldsByRec[r.id]?.['vendor'] ?? '', String(r.id).slice(0, 8), l.label ?? '', fmtDate(l.line_date), l.amount ?? '', l.principal ?? '', l.interest ?? '', l.balance ?? '', reviewOf(r)]);
+    return body.length ? toCsv([header, ...body]) : null;
+  }
+  function buildPayroll(): string | null {
+    const header = ['受信日時', '顧問先ID', '顧問先', '給与ID', '行', '従業員', '支給月', '総支給', '健康保険', '厚生年金', '雇用保険', '源泉所得税', '住民税', 'その他控除', '控除合計', '差引支給', '要確認'];
+    const body: (string | number | null)[][] = [];
+    for (const r of filtered.filter((r) => r.document_type === 'payslip' || r.document_type === 'wage_ledger'))
+      for (const p of payByRec[r.id] ?? [])
+        body.push([jst(r.created_at), clientCode(r), clientName(r), String(r.id).slice(0, 8), p.line_no, p.employee ?? '', p.pay_month ?? '', p.gross ?? '', p.health_insurance ?? '', p.pension ?? '', p.employment_insurance ?? '', p.income_tax ?? '', p.resident_tax ?? '', p.other_deduction ?? '', p.total_deduction ?? '', p.net ?? '', reviewOf(r)]);
+    return body.length ? toCsv([header, ...body]) : null;
   }
 
-  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
-  res.setHeader('Content-Disposition', `attachment; filename="perfect247_${fname}.csv"`);
+  // 種別を選んでいれば単一CSV、未選択(すべて)なら全ジャンルをZIPでまとめて出す
+  const singleFor = (t: string): string | null => {
+    if (t === 'bankbook' || t === 'petty_cash') return buildLedger(t);
+    if (t === 'credit_card') return buildCard();
+    if (t === 'inventory') return buildInventory();
+    if (t === 'loan_schedule') return buildLoan();
+    if (t === 'payslip' || t === 'wage_ledger') return buildPayroll();
+    return buildDocuments();
+  };
+
   res.setHeader('Cache-Control', 'no-store');
-  return res.status(200).send(csv);
+  if (fType) {
+    const csv = singleFor(fType) ?? toCsv([['データがありません']]);
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="perfect247_${fType}.csv"`);
+    return res.status(200).send(csv);
+  }
+
+  // すべて → 全ジャンルをZIP（中身は会計ソフト取込用CSV。READMEで各ファイルの説明）
+  const parts: { name: string; label: string; csv: string | null }[] = [
+    { name: 'documents.csv', label: '領収書・請求書・納付書・残高証明・固定資産・EC入金', csv: buildDocuments() },
+    { name: 'bankbook.csv', label: '通帳', csv: buildLedger('bankbook') },
+    { name: 'petty_cash.csv', label: '小口現金出納帳', csv: buildLedger('petty_cash') },
+    { name: 'credit_card.csv', label: 'クレジットカード明細', csv: buildCard() },
+    { name: 'payroll.csv', label: '給与明細・賃金台帳', csv: buildPayroll() },
+    { name: 'inventory.csv', label: '棚卸表', csv: buildInventory() },
+    { name: 'loan_schedule.csv', label: '借入金返済予定表', csv: buildLoan() },
+  ];
+  const present = parts.filter((p) => p.csv);
+  if (present.length === 0) {
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="perfect247_empty.csv"`);
+    return res.status(200).send(toCsv([['データがありません']]));
+  }
+  const zip = new JSZip();
+  for (const p of present) zip.file(p.name, p.csv as string);
+  zip.file(
+    'README.txt',
+    '﻿パーフェクト24/7 書類データ一式\n\n各CSVの内容:\n' +
+      present.map((p) => `  ${p.name} … ${p.label}`).join('\n') +
+      '\n\n※ CSVはUTF-8(BOM付)。Excelでそのまま開けます。\n',
+  );
+  const buf = await zip.generateAsync({ type: 'nodebuffer' });
+  const stamp = new Date().toISOString().slice(0, 10);
+  res.setHeader('Content-Type', 'application/zip');
+  res.setHeader('Content-Disposition', `attachment; filename="perfect247_all_${stamp}.zip"`);
+  return res.status(200).send(buf);
 }

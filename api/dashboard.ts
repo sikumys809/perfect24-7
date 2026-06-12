@@ -493,7 +493,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       <button type="submit">検索</button>
       ${fq || fClient ? `<a class="clear" href="${withParams({ client: '', q: '' })}">クリア</a>` : ''}
     </form>
-    <a class="csv" href="/api/export${withParams({})}">⬇ CSVダウンロード（${displayRecs.length}）</a>
+    <a class="csv" href="/api/export${withParams({})}">⬇ ${fType ? `CSVダウンロード（${displayRecs.length}）` : `全ジャンルCSV（ZIP）`}</a>
   </div>`;
 
   const summary = [
