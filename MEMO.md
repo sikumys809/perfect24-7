@@ -207,4 +207,10 @@ Generated on 2026-06-10
 - 修正は extracted_fields に `source=client`、`client_edited`=JST時刻を記録。事務所ダッシュに緑「顧問先修正」バッジ。金額編集時 amount=税込−消費税 を再計算。
 - 設計: 「顧問先=事実を直す／事務所=判断を持つ」。顧問先が直すほど事務所が楽＝回収率・二重ロックを深める相互扶助。
 
+## 基本情報＋OTPログイン（2026-06-12 続き・本番検証済み）
+- **migration 014適用済**: clients に trade_name/contact_name/email/phone/fiscal_start_month/fiscal_end_month(決算月)＋OTP用(otp_code/otp_expires/otp_attempts)。
+- **基本情報編集(P1)**: 顧問先側 /api/my?info=1（本人のみ）／事務所側 /api/dashboard?view=clients（保存は /api/settings の action=saveinfo）。両方で会社名/屋号/担当/email/携帯/期首期末を編集。
+- **OTPログイン(P3・本番稼働)**: 「コードだけログイン」を廃止。登録コード入力→そのLINEに6桁OTPプッシュ(5分)→OTP入力でCookie。コード→OTPはHMAC署名トークン(client_id+期限)で受け渡し。試行5回で無効化・再送あり。LINEプッシュは事務所トークン→env(LINE_CHANNEL_ACCESS_TOKEN)フォールバック。**LINE未連携のコードは拒否**（OTP届かないため）。
+- **resume: P2 = LIFF登録フォーム未実装**。要・ユーザーのLINE設定（LINEログインチャネル＋LIFFアプリ作成、エンドポイント /api/register、scope profile）→ LIFF IDをもらってから実装。follow時にLIFFリンクを返信→フォーム入力→client作成・LINE紐付け→登録コードをプッシュ、の流れ。
+
 *Generated on 2026-06-12*
