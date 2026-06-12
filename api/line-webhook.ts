@@ -161,6 +161,24 @@ async function replyLineMessage(accessToken: string, replyToken: string, text: s
   });
 }
 
+// テキスト＋クイックリプライ（postbackボタン）で返信
+async function replyLineMessageQuick(accessToken: string, replyToken: string, text: string, items: any[]) {
+  await fetch('https://api.line.me/v2/bot/message/reply', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${accessToken}` },
+    body: JSON.stringify({
+      replyToken,
+      messages: [{ type: 'text', text, quickReply: items.length ? { items } : undefined }],
+    }),
+  });
+}
+function trunc(s: string, n: number): string {
+  return s.length > n ? s.slice(0, n - 1) + '…' : s;
+}
+function quickPostback(label: string, data: string): any {
+  return { type: 'action', action: { type: 'postback', label: trunc(label, 20), data, displayText: label } };
+}
+
 // 友達追加・未登録時：LIFF登録フォームへのボタンを返す
 const LIFF_ID = process.env.LIFF_ID || '2010381453-fQ4q2Hlc';
 async function replyRegisterPrompt(accessToken: string, replyToken: string) {
@@ -1210,6 +1228,115 @@ async function findClientByLineUser(lineUserId: string, officeId: string | null)
   return data && data.length > 0 ? data[0] : null;
 }
 
+type ClientRow = { id: string; client_code: string; official_name: string };
+
+// LINE userId に紐づく顧問先（会社）を全件（古い順）。1LINE=複数法人に対応。
+async function getClientsForLineUser(lineUserId: string, officeId: string | null): Promise<ClientRow[]> {
+  let q = supabase
+    .from('clients')
+    .select('id, client_code, official_name')
+    .eq('linked_line_user_id', lineUserId)
+    .order('client_code', { ascending: true });
+  if (officeId) q = q.eq('office_id', officeId);
+  const { data } = await q;
+  return (data ?? []) as ClientRow[];
+}
+
+// 複数会社のとき、書類を入れる「アクティブ会社」を決める（保存済み状態 or 既定で先頭=最古）。
+async function resolveActiveClient(lineUserId: string, clients: ClientRow[]): Promise<ClientRow> {
+  try {
+    const { data } = await supabase
+      .from('line_sender_state')
+      .select('active_client_id')
+      .eq('line_user_id', lineUserId)
+      .maybeSingle();
+    const found = data?.active_client_id ? clients.find((c) => c.id === data.active_client_id) : null;
+    if (found) return found;
+  } catch {
+    /* テーブル未作成なら既定 */
+  }
+  return clients[0];
+}
+
+// アクティブ会社・直近 receipt 群を保存（選び直し用）。テーブル未作成でも握りつぶす
+async function saveSenderState(lineUserId: string, officeId: string | null, activeClientId: string, lastReceiptIds?: string[]) {
+  try {
+    const row: Record<string, unknown> = {
+      line_user_id: lineUserId,
+      office_id: officeId,
+      active_client_id: activeClientId,
+      updated_at: new Date().toISOString(),
+    };
+    if (lastReceiptIds) row.last_receipt_ids = lastReceiptIds;
+    await supabase.from('line_sender_state').upsert(row, { onConflict: 'line_user_id' });
+  } catch {
+    /* 未作成なら無視 */
+  }
+}
+
+// 複数会社のコンテキスト（送信直後の選び直し用）
+type MultiCtx = { lineUserId: string; officeId: string | null; activeId: string; activeName: string; others: ClientRow[] };
+
+// 書類登録後の返信。単一会社は従来どおりのテキスト。複数会社は登録先表示＋選び直しボタン。
+async function finishDoc(ctx: ReqCtx, ev: any, text: string, mc: MultiCtx | null, messageId: string) {
+  if (!ev.replyToken) return;
+  if (!mc) {
+    await replyLineMessage(ctx.accessToken, ev.replyToken, text);
+    return;
+  }
+  // 直前に作成した receipt 群を控える（postbackで会社を移すため）
+  let ids: string[] = [];
+  try {
+    const { data } = await supabase.from('receipts').select('id').eq('original_filename', messageId);
+    ids = (data ?? []).map((r: any) => r.id);
+  } catch {
+    /* noop */
+  }
+  await saveSenderState(mc.lineUserId, mc.officeId, mc.activeId, ids);
+  const items = mc.others.slice(0, 12).map((c) => quickPostback(`${trunc(c.official_name, 16)}に変更`, `reassign|${c.id}`));
+  const full = `${text}\n\n📁 登録先: ${mc.activeName}\n別の会社ならボタンで選び直せます`;
+  await replyLineMessageQuick(ctx.accessToken, ev.replyToken, full, items);
+}
+
+// postback（選び直し / 会社切替）の処理
+async function handlePostback(ev: any, lineUserId: string | null, ctx: ReqCtx) {
+  if (!lineUserId || !ev.replyToken) return;
+  const data = String(ev.postback?.data ?? '');
+  const [action, clientId] = data.split('|');
+  const clients = await getClientsForLineUser(lineUserId, ctx.officeId);
+  const target = clients.find((c) => c.id === clientId);
+  if (!target) {
+    await replyLineMessage(ctx.accessToken, ev.replyToken, '対象の会社が見つかりませんでした。');
+    return;
+  }
+  if (action === 'reassign') {
+    let moved = 0;
+    try {
+      const { data: st } = await supabase
+        .from('line_sender_state')
+        .select('last_receipt_ids')
+        .eq('line_user_id', lineUserId)
+        .maybeSingle();
+      const ids: string[] = st?.last_receipt_ids ?? [];
+      if (ids.length) {
+        await supabase.from('receipts').update({ client_id: target.id }).in('id', ids);
+        moved = ids.length;
+      }
+    } catch {
+      /* noop */
+    }
+    await saveSenderState(lineUserId, ctx.officeId, target.id);
+    await replyLineMessage(
+      ctx.accessToken,
+      ev.replyToken,
+      `直前の書類${moved ? `（${moved}件）` : ''}を「${target.official_name}」に変更しました。\n今後もこの会社に登録します（変更は「切替」）。`,
+    );
+  } else if (action === 'setactive') {
+    await saveSenderState(lineUserId, ctx.officeId, target.id);
+    await replyLineMessage(ctx.accessToken, ev.replyToken, `登録先を「${target.official_name}」に切り替えました。`);
+  }
+}
+
 // 顧問先が送り続けたくなる即時フィードバック用に、当月の登録件数・累計金額を返す。
 // （回収率＝堀。送ると「今月N件目・累計¥X」が即返る）。失敗しても本処理は止めない。
 async function monthlyTallyLine(clientId: string | null | undefined): Promise<string> {
@@ -1231,26 +1358,26 @@ async function monthlyTallyLine(clientId: string | null | undefined): Promise<st
   }
 }
 
-// テキスト（=登録コード想定）を処理して顧問先をひもづける
-async function handleRegistration(ev: any, lineUserId: string | null, ctx: ReqCtx) {
+// テキスト処理: 「切替」コマンド or 登録コード（新規/追加会社のひもづけ）。1LINE=複数法人に対応。
+async function handleText(ev: any, lineUserId: string | null, ctx: ReqCtx) {
   if (!lineUserId) return;
+  const text = String(ev.message?.text ?? '').trim();
+  const clients = await getClientsForLineUser(lineUserId, ctx.officeId);
 
-  // 既にひもづいていれば案内のみ
-  const existing = await findClientByLineUser(lineUserId, ctx.officeId);
-  if (existing) {
-    if (ev.replyToken) {
-      await replyLineMessage(
-        ctx.accessToken,
-        ev.replyToken,
-        `${existing.official_name} 様として登録済みです（顧問先ID: ${existing.client_code}）。\n領収書・請求書・通帳を送ってください。`,
-      );
+  // 「切替」: 登録先の会社を選び直す（複数会社のとき）
+  if (/^(切替|切り替え|きりかえ|会社切替|会社切り替え|会社変更)$/.test(text)) {
+    if (clients.length <= 1) {
+      if (ev.replyToken) await replyLineMessage(ctx.accessToken, ev.replyToken, '登録されている会社は1社です。複数社ある場合に切り替えできます。');
+      return;
     }
+    const active = await resolveActiveClient(lineUserId, clients);
+    const items = clients.slice(0, 12).map((c) => quickPostback(`${trunc(c.official_name, 16)}${c.id === active.id ? '（現在）' : ''}`, `setactive|${c.id}`));
+    if (ev.replyToken) await replyLineMessageQuick(ctx.accessToken, ev.replyToken, '登録先の会社を選んでください。', items);
     return;
   }
 
-  const code = String(ev.message?.text ?? '').trim().toUpperCase();
-
-  // 未ひもづけの顧問先を登録コードで検索（事務所が解決済みならその事務所内に限定）
+  // 登録コードとして処理（未ひもづけの顧問先を検索）
+  const code = text.toUpperCase();
   let q = supabase
     .from('clients')
     .select('id, client_code, official_name')
@@ -1261,17 +1388,19 @@ async function handleRegistration(ev: any, lineUserId: string | null, ctx: ReqCt
   const client = data && data.length > 0 ? data[0] : null;
 
   if (!client) {
+    // コードに該当なし。登録済みなら使い方、未登録ならLIFF登録案内
     if (ev.replyToken) {
-      await replyLineMessage(
-        ctx.accessToken,
-        ev.replyToken,
-        '登録コードが正しくないか、既に使用済みです。事務所にご確認ください。',
-      );
+      if (clients.length > 0) {
+        const sw = clients.length > 1 ? '\n登録先の会社を変えるには「切替」と送信してください。' : '';
+        await replyLineMessage(ctx.accessToken, ev.replyToken, `領収書・請求書・通帳などを撮って送ってください。${sw}`);
+      } else {
+        await replyRegisterPrompt(ctx.accessToken, ev.replyToken);
+      }
     }
     return;
   }
 
-  // ひもづけ（競合防止のため linked_line_user_id が null の行のみ更新）
+  // ひもづけ（競合防止のため null の行のみ更新）＝新規 or 追加会社
   const { data: updated } = await supabase
     .from('clients')
     .update({ linked_line_user_id: lineUserId, linked_at: new Date().toISOString() })
@@ -1280,20 +1409,23 @@ async function handleRegistration(ev: any, lineUserId: string | null, ctx: ReqCt
     .select('id')
     .limit(1);
 
+  if (!(updated && updated.length > 0)) {
+    if (ev.replyToken) await replyLineMessage(ctx.accessToken, ev.replyToken, 'この登録コードは既に使用済みです。事務所にご確認ください。');
+    return;
+  }
+
+  // 登録した会社をアクティブにする（直後の送信はこの会社へ）
+  await saveSenderState(lineUserId, ctx.officeId, client.id);
+  const isAdd = clients.length > 0; // 既に他の会社がある＝追加登録
   if (ev.replyToken) {
-    if (updated && updated.length > 0) {
-      await replyLineMessage(
-        ctx.accessToken,
-        ev.replyToken,
-        `${client.official_name} 様、登録が完了しました（顧問先ID: ${client.client_code}）。\n領収書・請求書・通帳の画像/PDFを送ってください。`,
-      );
-    } else {
-      await replyLineMessage(
-        ctx.accessToken,
-        ev.replyToken,
-        'この登録コードは既に使用済みです。事務所にご確認ください。',
-      );
-    }
+    const note = isAdd
+      ? `\n（${clients.length + 1}社目）今後この会社に登録します。会社の切替は「切替」と送信。`
+      : '\n領収書・請求書・通帳の画像/PDFを送ってください。';
+    await replyLineMessage(
+      ctx.accessToken,
+      ev.replyToken,
+      `${client.official_name} 様、登録が完了しました（顧問先ID: ${client.client_code}）。${note}`,
+    );
   }
 }
 
@@ -1320,22 +1452,41 @@ async function processWebhookEvents(bodyText: string, ctx: ReqCtx) {
         continue;
       }
 
+      // postback（送信直後の選び直し / 会社切替）
+      if (ev.type === 'postback') {
+        await handlePostback(ev, lineUserId, ctx);
+        continue;
+      }
+
       if (ev.type !== 'message') continue;
       const msgType = ev.message?.type;
 
-      // テキストは登録コードとして処理
+      // テキストは「切替」コマンド or 登録コードとして処理
       if (msgType === 'text') {
-        await handleRegistration(ev, lineUserId, ctx);
+        await handleText(ev, lineUserId, ctx);
         continue;
       }
 
       if (msgType !== 'image' && msgType !== 'file') continue;
 
-      // 書類は登録済み顧問先のみ受付（未登録は登録を促す）
-      const client = lineUserId ? await findClientByLineUser(lineUserId, ctx.officeId) : null;
-      if (!client) {
+      // 書類は登録済み顧問先のみ受付（未登録は登録を促す）。1LINE=複数法人に対応。
+      const myClients = lineUserId ? await getClientsForLineUser(lineUserId, ctx.officeId) : [];
+      if (myClients.length === 0) {
         if (ev.replyToken) await replyRegisterPrompt(ctx.accessToken, ev.replyToken);
         continue;
+      }
+      // 1社なら従来どおり（プロンプト無し）。複数社ならアクティブ会社を使い、選び直し用 mc を作る。
+      let client: ClientRow = myClients[0];
+      let mc: MultiCtx | null = null;
+      if (myClients.length > 1) {
+        client = await resolveActiveClient(lineUserId as string, myClients);
+        mc = {
+          lineUserId: lineUserId as string,
+          officeId: ctx.officeId,
+          activeId: client.id,
+          activeName: client.official_name,
+          others: myClients.filter((c) => c.id !== client.id),
+        };
       }
 
       const messageId = ev.message.id;
@@ -1431,11 +1582,7 @@ async function processWebhookEvents(bodyText: string, ctx: ReqCtx) {
             ? `\n⚠️ ${validation.badLines.join(', ')}行目の残高が合いません（金額の誤読の可能性。要確認）`
             : '';
           const tally = await monthlyTallyLine(client.id);
-          await replyLineMessage(
-            ctx.accessToken,
-            ev.replyToken,
-            `${label}を登録しました（明細${count}件）${warn}${tally}`,
-          );
+          await finishDoc(ctx, ev, `${label}を登録しました（明細${count}件）${warn}${tally}`, mc, messageId);
         }
         continue;
       }
@@ -1465,11 +1612,7 @@ async function processWebhookEvents(bodyText: string, ctx: ReqCtx) {
         if (ev.replyToken) {
           const tally = await monthlyTallyLine(client.id);
           const head = cardName ? `カード明細（${cardName}）` : 'カード明細';
-          await replyLineMessage(
-            ctx.accessToken,
-            ev.replyToken,
-            `${head}を登録しました（${count}件・合計¥${total.toLocaleString()}）${tally}`,
-          );
+          await finishDoc(ctx, ev, `${head}を登録しました（${count}件・合計¥${total.toLocaleString()}）${tally}`, mc, messageId);
         }
         continue;
       }
@@ -1489,7 +1632,7 @@ async function processWebhookEvents(bodyText: string, ctx: ReqCtx) {
         if (ev.replyToken) {
           const tally = await monthlyTallyLine(client.id);
           const warn = badLines.length ? `\n⚠️ ${badLines.join(', ')}行目の数量×単価が金額と合いません（要確認）` : '';
-          await replyLineMessage(ctx.accessToken, ev.replyToken, `棚卸表を登録しました（${count}品目・在庫金額¥${total.toLocaleString()}）${warn}${tally}`);
+          await finishDoc(ctx, ev, `棚卸表を登録しました（${count}品目・在庫金額¥${total.toLocaleString()}）${warn}${tally}`, mc, messageId);
         }
         continue;
       }
@@ -1510,7 +1653,7 @@ async function processWebhookEvents(bodyText: string, ctx: ReqCtx) {
           const tally = await monthlyTallyLine(client.id);
           const head = lender ? `返済予定表（${lender}）` : '返済予定表';
           const warn = badLines.length ? `\n⚠️ ${badLines.join(', ')}行目の金額が合いません（手書き等の誤読の可能性。要確認）` : '';
-          await replyLineMessage(ctx.accessToken, ev.replyToken, `${head}を登録しました（${count}回分）${warn}${tally}`);
+          await finishDoc(ctx, ev, `${head}を登録しました（${count}回分）${warn}${tally}`, mc, messageId);
         }
         continue;
       }
@@ -1531,7 +1674,7 @@ async function processWebhookEvents(bodyText: string, ctx: ReqCtx) {
           const label = docType === 'wage_ledger' ? '賃金台帳' : '給与明細';
           const body = docType === 'wage_ledger' ? `${count}名分・総支給計¥${total.toLocaleString()}` : `総支給¥${total.toLocaleString()}`;
           const warn = badLines.length ? `\n⚠️ ${badLines.join(', ')}行目の金額が合いません（要確認）` : '';
-          await replyLineMessage(ctx.accessToken, ev.replyToken, `${label}を登録しました（${body}）${warn}${tally}`);
+          await finishDoc(ctx, ev, `${label}を登録しました（${body}）${warn}${tally}`, mc, messageId);
         }
         continue;
       }
@@ -1568,7 +1711,7 @@ async function processWebhookEvents(bodyText: string, ctx: ReqCtx) {
         const head =
           receipts.length > 1 ? `登録しました（${receipts.length}件）\n` : '登録しました。\n';
         const tally = await monthlyTallyLine(client.id);
-        await replyLineMessage(ctx.accessToken, ev.replyToken, head + summaries.join('\n') + tally);
+        await finishDoc(ctx, ev, head + summaries.join('\n') + tally, mc, messageId);
       }
     } catch (err) {
       console.error('Event processing error:', err);
