@@ -16,7 +16,8 @@
     "@anthropic-ai/sdk": "^0.70.1",
     "@supabase/supabase-js": "^2.0.0",
     "@vercel/functions": "^1.0.0",
-    "dotenv": "^16.0.0"
+    "dotenv": "^16.0.0",
+    "pdf-lib": "^1.17.1"
   },
   "devDependencies": {
     "@google/genai": "^1.52.0",

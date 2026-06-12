@@ -3,6 +3,7 @@ import crypto from 'node:crypto';
 import { waitUntil } from '@vercel/functions';
 import { createClient } from '@supabase/supabase-js';
 import Anthropic from '@anthropic-ai/sdk';
+import { PDFDocument } from 'pdf-lib';
 // 注意: この Vercel 設定では api/ 内の相互 import が実行時に解決されない（各ファイルが個別
 // トランスパイルされ兄弟ファイルがバンドルされない）ため、会計ロジックはここにインラインで持つ。
 // 勘定科目コードは 011_account_titles.sql と一致。
@@ -557,6 +558,70 @@ type SaveCtx = {
   officeId?: string | null; // どの事務所宛か（未解決=null。後方互換のため null なら列を付けない）
   accounts?: Account[]; // 事務所の勘定科目マスタ（科目自動付与用。未適用なら空）
 };
+
+// ── 巨大PDF対策（②-2）: ページ分割→並列抽出→種別ごとにマージ ──
+// 時間(60s)と出力トークン(途中切れ)の両方の壁を越える。画像・小さいPDFはそのまま1回。
+function arrKeyForType(t: string | null | undefined): 'receipts' | 'transactions' | 'lines' | null {
+  if (!t) return null;
+  if (t === 'bankbook' || t === 'credit_card' || t === 'petty_cash') return 'transactions';
+  if (t === 'inventory' || t === 'loan_schedule' || t === 'payslip' || t === 'wage_ledger') return 'lines';
+  if (t === 'receipt' || t === 'invoice' || t === 'tax_payment' || t === 'balance_certificate' || t === 'fixed_asset' || t === 'ec_payout') return 'receipts';
+  return null;
+}
+// 各ページの抽出結果を1つにまとめる。最多の document_type を採用し、その配列を順に連結。
+function mergeChunkDocs(docs: any[]): any {
+  const counts: Record<string, number> = {};
+  for (const d of docs) { const t = d?.document_type; if (typeof t === 'string' && t !== 'other') counts[t] = (counts[t] || 0) + 1; }
+  let dominant: string | null = null, best = 0;
+  for (const t of Object.keys(counts)) if (counts[t] > best) { best = counts[t]; dominant = t; }
+  if (!dominant) dominant = docs.find((d) => typeof d?.document_type === 'string')?.document_type ?? 'other';
+  const merged: any = { document_type: dominant };
+  const key = arrKeyForType(dominant);
+  if (key) {
+    const arr: any[] = [];
+    for (const d of docs) { const a = d?.[key]; if (Array.isArray(a)) arr.push(...a); }
+    merged[key] = arr;
+  }
+  merged.card_name = docs.find((d) => d?.card_name)?.card_name ?? null;
+  merged.lender = docs.find((d) => d?.lender)?.lender ?? null;
+  merged.as_of_date = docs.find((d) => d?.as_of_date)?.as_of_date ?? null;
+  return merged;
+}
+// PDFは5ページ超なら3ページずつに分割し、各チャンクを並列抽出してマージ。それ以外は丸ごと1回。
+async function extractDocumentMerged(
+  buffer: Buffer,
+  contentType: string,
+  clientName?: string,
+  accounts?: Account[],
+): Promise<any> {
+  if (!contentType.includes('pdf')) return extractDocument(buffer, contentType, clientName, accounts);
+  let chunks: Buffer[] = [];
+  try {
+    const src = await PDFDocument.load(buffer, { ignoreEncryption: true });
+    const total = src.getPageCount();
+    if (total <= 4) return extractDocument(buffer, contentType, clientName, accounts);
+    for (let start = 0; start < total; start += 3) {
+      const out = await PDFDocument.create();
+      const idxs: number[] = [];
+      for (let i = start; i < Math.min(start + 3, total); i++) idxs.push(i);
+      const pages = await out.copyPages(src, idxs);
+      pages.forEach((p) => out.addPage(p));
+      chunks.push(Buffer.from(await out.save()));
+    }
+  } catch {
+    return extractDocument(buffer, contentType, clientName, accounts); // 分割失敗時は丸ごと1回
+  }
+  const docs: any[] = [];
+  const CONC = 5; // 同時実行数を抑えてレート制限を避ける
+  for (let i = 0; i < chunks.length; i += CONC) {
+    const res = await Promise.all(
+      chunks.slice(i, i + CONC).map((c) => extractDocument(c, 'application/pdf', clientName, accounts).catch(() => null)),
+    );
+    for (const r of res) if (r) docs.push(r);
+  }
+  if (docs.length === 0) throw new Error('no_pages_extracted');
+  return mergeChunkDocs(docs);
+}
 
 // 会社名の表記揺れを吸収して比較するための正規化（法人格・空白を除去）
 function normName(s: unknown): string {
@@ -1300,7 +1365,7 @@ async function processWebhookEvents(bodyText: string, ctx: ReqCtx) {
       // 抽出（複数件）
       let doc: any;
       try {
-        doc = await extractDocument(buffer, contentType, client.official_name, accounts);
+        doc = await extractDocumentMerged(buffer, contentType, client.official_name, accounts);
       } catch (exErr) {
         console.error('Extraction error:', exErr);
         await saveUnprocessed(saveCtx, String(exErr));
