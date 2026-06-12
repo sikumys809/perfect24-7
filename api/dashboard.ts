@@ -362,14 +362,12 @@ function renderClientsPage(clients: Row[], key: string): string {
       <input type="hidden" name="action" value="saveinfo"><input type="hidden" name="client" value="${esc(c.id)}">${keyField}
       <div class="ch"><b>${esc(c.client_code)}</b>${c.linked_line_user_id ? '<span class="lk">LINE連携済</span>' : '<span class="nlk">未連携</span>'}</div>
       <div class="grid">
-        <label>会社名<input name="official_name" value="${esc(c.official_name ?? '')}"></label>
-        <label>屋号<input name="trade_name" value="${esc(c.trade_name ?? '')}"></label>
+        <label>会社名・屋号<input name="official_name" value="${esc(c.official_name ?? '')}"></label>
         <label>担当者<input name="contact_name" value="${esc(c.contact_name ?? '')}"></label>
-        <label>メール<input name="email" value="${esc(c.email ?? '')}"></label>
-        <label>携帯<input name="phone" value="${esc(c.phone ?? '')}"></label>
         <label>期首<select name="fiscal_start_month">${monthOpts(c.fiscal_start_month)}</select></label>
         <label>期末(決算月)<select name="fiscal_end_month">${monthOpts(c.fiscal_end_month)}</select></label>
       </div>
+      <div style="margin:8px 0;font-size:.82rem;color:#475569">📧 ${esc(c.email || '—')}　／　📱 ${esc(c.phone || '—')}　<span style="color:#94a3b8">（連絡先は顧問先のみ編集可）</span></div>
       <button type="submit">保存</button>
     </form>`,
     )

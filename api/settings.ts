@@ -28,14 +28,13 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       const n = Number(String(v ?? '').replace(/[^0-9.-]/g, ''));
       return !Number.isNaN(n) && n >= 1 && n <= 12 ? Math.round(n) : null;
     };
+    // 事務所側は 会社名・屋号(official_name)/担当者/決算月のみ編集可。
+    // メール・携帯は顧問先本人の連絡先なので顧問先側(/api/my?info=1)でのみ編集する。
     await supabase
       .from('clients')
       .update({
         official_name: String(b.official_name ?? '').trim() || '（未設定）',
-        trade_name: String(b.trade_name ?? '').trim() || null,
         contact_name: String(b.contact_name ?? '').trim() || null,
-        email: String(b.email ?? '').trim() || null,
-        phone: String(b.phone ?? '').trim() || null,
         fiscal_start_month: fm(b.fiscal_start_month),
         fiscal_end_month: fm(b.fiscal_end_month),
       })

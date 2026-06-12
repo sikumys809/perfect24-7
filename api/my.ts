@@ -641,10 +641,8 @@ function renderInfoPage(c: Row, saved: boolean): string {
     <input type="hidden" name="action" value="saveinfo">
     <h2>会社の基本情報</h2>
     <p class="sub">決算月などの把握に使います。変更があればいつでも直してください。（登録コード: ${esc(c.client_code)}）</p>
-    <label>会社名</label>
-    <input name="official_name" value="${esc(c.official_name ?? '')}" required>
-    <label>屋号</label>
-    <input name="trade_name" value="${esc(c.trade_name ?? '')}" placeholder="任意">
+    <label>会社名・屋号</label>
+    <input name="official_name" value="${esc(c.official_name ?? '')}" required placeholder="株式会社○○ ／ ○○商店">
     <label>担当者名</label>
     <input name="contact_name" value="${esc(c.contact_name ?? '')}">
     <label>メールアドレス</label>
@@ -778,7 +776,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       .from('clients')
       .update({
         official_name: String(b.official_name ?? '').trim() || '（未設定）',
-        trade_name: String(b.trade_name ?? '').trim() || null,
         contact_name: String(b.contact_name ?? '').trim() || null,
         email: String(b.email ?? '').trim() || null,
         phone: String(b.phone ?? '').trim() || null,
