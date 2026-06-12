@@ -97,7 +97,7 @@ function page(): string {
   document.getElementById('f').addEventListener('submit',function(ev){
     ev.preventDefault();
     var btn=this.querySelector('button');btn.disabled=true;btn.textContent='登録中…';
-    var data={idToken:liff.getIDToken()};
+    var data={accessToken:liff.getAccessToken()};
     var f=this;
     ['official_name','trade_name','contact_name','email','phone','fiscal_start_month','fiscal_end_month'].forEach(function(n){data[n]=(f.elements[n]||{}).value||'';});
     fetch('/api/register',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)})
@@ -123,22 +123,21 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method !== 'POST') return res.status(405).json({ ok: false, message: 'POST only' });
 
   const b: any = req.body ?? {};
-  const idToken = b.idToken;
-  if (!idToken || typeof idToken !== 'string') return res.status(400).json({ ok: false, message: '認証情報がありません。' });
+  const accessToken = b.accessToken;
+  if (!accessToken || typeof accessToken !== 'string') return res.status(400).json({ ok: false, message: '認証情報がありません。LINE内で開き直してお試しください。' });
 
-  // LIFF の ID トークンをサーバ検証 → 本物の userId(sub) を取得（なりすまし防止）
+  // LIFF のアクセストークンをサーバ検証（profileスコープのみでOK）→ 本物の userId を取得。
+  //  1) トークンが自分のチャネル(LOGIN_CHANNEL_ID)宛か検証（他アプリのトークン流用を防ぐ）
+  //  2) /v2/profile で userId を取得
   let userId: string | null = null;
   try {
-    const params = new URLSearchParams();
-    params.set('id_token', idToken);
-    params.set('client_id', LOGIN_CHANNEL_ID);
-    const vr = await fetch('https://api.line.me/oauth2/v2.1/verify', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: params.toString(),
-    });
+    const vr = await fetch('https://api.line.me/oauth2/v2.1/verify?access_token=' + encodeURIComponent(accessToken));
     const v: any = await vr.json();
-    if (vr.ok && v && typeof v.sub === 'string') userId = v.sub;
+    if (vr.ok && v && String(v.client_id) === LOGIN_CHANNEL_ID) {
+      const pr = await fetch('https://api.line.me/v2/profile', { headers: { Authorization: `Bearer ${accessToken}` } });
+      const p: any = await pr.json();
+      if (pr.ok && p && typeof p.userId === 'string') userId = p.userId;
+    }
   } catch {
     /* fallthrough */
   }
