@@ -1376,6 +1376,12 @@ async function handleText(ev: any, lineUserId: string | null, ctx: ReqCtx) {
     return;
   }
 
+  // 「会社追加」: 別の会社をLIFFフォームから自己登録する案内を返す
+  if (/^(会社追加|会社を追加|追加登録|会社登録)$/.test(text)) {
+    if (ev.replyToken) await replyRegisterPrompt(ctx.accessToken, ev.replyToken);
+    return;
+  }
+
   // 登録コードとして処理（未ひもづけの顧問先を検索）
   const code = text.toUpperCase();
   let q = supabase

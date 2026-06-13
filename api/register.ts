@@ -86,7 +86,8 @@ function page(): string {
         if(j.ok){
           document.getElementById('f').style.display='none';
           var d=document.getElementById('done');d.style.display='block';
-          d.innerHTML='<h1>登録が完了しました 🎉</h1><p class="sub">あなたのログインコードです（LINEにも送りました）</p><div class="code">'+j.code+'</div><p class="sub">確認ページにログインするときに使います。<br>領収書・請求書はこのトークに撮って送るだけでOKです。</p><button onclick="try{liff.closeWindow()}catch(e){}">閉じる</button>';
+          var addNote=(j.companyNo&&j.companyNo>1)?'<p class="sub">'+j.companyNo+'社目として登録しました。会社の切替はトークで「切替」と送ってください。</p>':'';
+          d.innerHTML='<h1>登録が完了しました 🎉</h1>'+addNote+'<p class="sub">あなたのログインコードです（LINEにも送りました）</p><div class="code">'+j.code+'</div><p class="sub">確認ページにログインするときに使います。<br>領収書・請求書はこのトークに撮って送るだけでOKです。</p><button onclick="try{liff.closeWindow()}catch(e){}">閉じる</button>';
         }else{btn.disabled=false;btn.textContent='この内容で登録する';alert(j.message||'登録に失敗しました');}
       }).catch(function(){btn.disabled=false;btn.textContent='この内容で登録する';alert('通信エラーが発生しました');});
   });
@@ -137,36 +138,47 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
   let code = '';
   let clientCode = '';
+  let companyNo = 1;
   try {
-    const { data: existing } = await supabase
+    // 既に登録済みの会社数（何社目か）。1LINE=複数法人に対応。
+    const { count } = await supabase
       .from('clients')
+      .select('id', { count: 'exact', head: true })
+      .eq('linked_line_user_id', userId);
+    companyNo = (count ?? 0) + 1;
+
+    // LIFF登録は「常に新規1社」を作る（既存会社の情報編集は /api/my?info=1 側）。
+    const { data: created, error } = await supabase
+      .from('clients')
+      .insert({ ...basic, linked_line_user_id: userId, office_id: officeId, linked_at: new Date().toISOString() })
       .select('id, client_code, registration_code')
-      .eq('linked_line_user_id', userId)
-      .limit(1);
-    if (existing && existing.length) {
-      await supabase.from('clients').update(basic).eq('id', existing[0].id);
-      code = existing[0].registration_code;
-      clientCode = existing[0].client_code;
-    } else {
-      const { data: created, error } = await supabase
-        .from('clients')
-        .insert({ ...basic, linked_line_user_id: userId, office_id: officeId, linked_at: new Date().toISOString() })
-        .select('client_code, registration_code')
-        .single();
-      if (error || !created) throw error || new Error('insert failed');
-      code = created.registration_code;
-      clientCode = created.client_code;
+      .single();
+    if (error || !created) throw error || new Error('insert failed');
+    code = created.registration_code;
+    clientCode = created.client_code;
+
+    // 追加した会社を「アクティブ会社」にする（次の送信はこの会社へ）
+    try {
+      await supabase.from('line_sender_state').upsert(
+        { line_user_id: userId, office_id: officeId, active_client_id: created.id, updated_at: new Date().toISOString() },
+        { onConflict: 'line_user_id' },
+      );
+    } catch {
+      /* line_sender_state 未作成でも無視 */
     }
   } catch (e) {
     console.error('register error', e);
     return res.status(500).json({ ok: false, message: '登録の保存に失敗しました。時間をおいて再度お試しください。' });
   }
 
+  const isAdd = companyNo > 1;
   await pushLine(
     officeId,
     userId,
-    `ご登録ありがとうございます。\n\n【ログインコード】${code}\n\n確認ページにログインする時にこのコードを入力すると、LINEにワンタイムパスワードが届きます。\n\n領収書・請求書・通帳などは、このトークに撮って送るだけでOKです。`,
+    isAdd
+      ? `「${basic.official_name}」を追加登録しました（${companyNo}社目）。\n\n【この会社のログインコード】${code}\n\n以後この会社に登録します。会社を切り替えるには「切替」と送ってください。書類はそのまま撮って送るだけでOKです。`
+      : `ご登録ありがとうございます。\n\n【ログインコード】${code}\n\n確認ページにログインする時にこのコードを入力すると、LINEにワンタイムパスワードが届きます。\n\n領収書・請求書・通帳などは、このトークに撮って送るだけでOKです。`,
   );
 
-  return res.status(200).json({ ok: true, code, client_code: clientCode });
+  return res.status(200).json({ ok: true, code, client_code: clientCode, companyNo });
 }
